@@ -1,0 +1,135 @@
+<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>Native wire contract · maczo docs</title>
+<link href="https://fonts.googleapis.com/css2?family=Bai+Jamjuree:wght@400;600;700&display=swap" rel="stylesheet"><style>*{box-sizing:border-box}body{margin:0;background:#0F212E;color:#cfe3f2;font-family:'Bai Jamjuree',system-ui,-apple-system,'Segoe UI',sans-serif;line-height:1.55}
+a{color:#1FFF20;text-decoration:none}a:hover{text-decoration:underline}
+header.top{position:sticky;top:0;background:#152a3a;border-bottom:1px solid #24455c;padding:12px 22px}
+header.top .logo{color:#1FFF20;font-weight:700}header.top a{color:#cfe3f2}
+main{max-width:860px;margin:0 auto;padding:28px 22px 60px}
+h1,h2,h3,h4{color:#fff;line-height:1.25}h1{border-bottom:1px solid #24455c;padding-bottom:8px}
+code{background:#0a1620;border:1px solid #1b3547;border-radius:4px;padding:1px 5px;font-size:.92em}
+pre{background:#0a1620;border:1px solid #24455c;border-radius:8px;padding:14px;overflow:auto}pre code{border:0;padding:0}
+table{border-collapse:collapse;margin:14px 0;width:100%;display:block;overflow-x:auto}
+th,td{border:1px solid #24455c;padding:7px 11px;text-align:left}th{background:#152a3a;color:#fff}
+blockquote{border-left:3px solid #1475E1;margin:14px 0;padding:6px 14px;background:#152a3a;border-radius:0 6px 6px 0}
+.cards{display:grid;gap:14px}.card{background:#152a3a;border:1px solid #24455c;border-radius:12px;padding:18px}
+.card h3{margin:0 0 6px}.muted{color:#7fa0b8}</style></head><body>
+<header class=top><a href="index.html"><span class=logo>maczo ●</span> Docs</a> &nbsp;·&nbsp; <a href="api.html">API reference</a></header>
+<main><h1 id="maczo-native-wire-contract-canonical-dialect-for-external-merchants">maczo NATIVE wire contract (canonical dialect for external merchants)</h1>
+<blockquote>
+<p>The exact, implemented wire an external <strong>merchant</strong> integrates against. This is the <strong>canonical</strong>
+dialect (clean JSON, header HMAC-SHA256, integer minor units + full <code>currency_exp</code>, a real
+<code>status(txn_ref)</code>). The bx/SG/Regem dialects (<a ><code>ORIGINALS-BX-WIRE.md</code></a>,
+<a href="api.html"><code>wallet-api/maczo-wallet-protocol.md</code></a>) are <strong>legacy</strong> and kept
+only for operators already integrated on them.</p>
+<p>Machine-readable: <a href="api.html"><code>wallet-api/maczo-native-seamless.v1.yaml</code></a>
+(OpenAPI 3.0.3, validated). Central types (code): <a ><code>libs/wallet_spec/</code></a>.</p>
+</blockquote>
+<h2 id="1-roles-directions">1. Roles &amp; directions</h2>
+<ul>
+<li><strong>maczo = game provider.</strong> Runs the provably-fair games + UI.</li>
+<li><strong>merchant (operator) = money source of truth.</strong> Holds the player's real balance. maczo's ledger is a
+  display-only mirror; maczo never authorizes a bet on a balance it computed.</li>
+</ul>
+<p>Two independent directions:</p>
+<pre><code>(1) LAUNCH + CATALOG + KICK   merchant ──▶ maczo   (POST /GameLogin, /GetGameList, /KickPlayer, /ReplayLogin)
+(2) SEAMLESS WALLET (money)   maczo ──▶ merchant   (POST {base}{prefix}/debit|credit|rollback|status|balance)
+</code></pre>
+<p>You (the merchant) implement <strong>both</strong>: the small launch/catalog surface you <em>call on us</em>, and the
+<strong>seamless wallet</strong> we <em>call on you</em>.</p>
+<h2 id="2-identity-signing-header-hmac-sha256">2. Identity &amp; signing (header HMAC-SHA256)</h2>
+<p>Each merchant is registered in maczo's operator registry with an <code>operator_id</code>, a wallet callback base
+URL + path prefix, an inbound IP allowlist, allowed currencies/games, and one or more <strong>signing keys</strong>
+(versioned by <code>key_id</code>, so a key can be rotated with an overlap window). Your signing secret never
+crosses the wire.</p>
+<p>Every request (both directions) is signed:</p>
+<ul>
+<li><code>X-Signature</code>: <code>HMAC_SHA256(secret, canonical)</code> lowercase hex</li>
+<li><code>X-Timestamp</code>: unix seconds (integer string), within <strong>±60 s</strong> of now</li>
+<li><code>X-Nonce</code>: single-use opaque nonce (reject a seen nonce)</li>
+<li><code>X-Key-Id</code>: selects the per-merchant key</li>
+</ul>
+<p><code>canonical</code> is the newline-joined string (no trailing newline):</p>
+<pre><code>METHOD
+PATH
+X-Timestamp
+X-Nonce
+sha256hex(rawBody)      # sha256 of the exact request-body bytes; empty body -&gt; sha256(&quot;&quot;)
+</code></pre>
+<p>Reference implementation: <a ><code>libs/native_sig/sig.py</code></a>. Reject outside the
+window or on a replayed nonce (fail closed → <code>SIGNATURE_OR_CLOCK</code>).</p>
+<h2 id="3-money-model-non-negotiable">3. Money model (non-negotiable)</h2>
+<ul>
+<li><strong>HTTP status is ALWAYS <code>200</code>.</strong> Classify the outcome on the body <code>code</code>, never on the HTTP status.</li>
+<li>Amounts are <strong>integer minor units</strong> (<code>amount_minor</code>) + <code>currency</code> (ISO-4217) + <code>currency_exp</code>
+  (minor-unit exponent). Never a float; the full <code>currency_exp</code> is supported (no 2-dp cap).</li>
+<li><strong>Idempotency key = <code>txn_ref</code>.</strong> A duplicate returns <code>code: DUPLICATE</code>, <code>duplicate: true</code>, and the
+  <strong>live</strong> balance — it never re-moves money.</li>
+<li>A <code>credit</code> (win) or <code>rollback</code> MUST reference a prior applied debit via <code>ref_txn_ref</code>; a settle with no
+  prior debit returns <code>code: TXN_NOT_FOUND</code> (never silent).</li>
+<li><code>status(txn_ref)</code> is a <strong>read-only</strong> query of whether a move applied — it MUST NOT move money.</li>
+<li>Unknown / unrecognised <code>code</code> ⇒ fail closed (treated as <code>BAD_REQUEST</code>).</li>
+</ul>
+<p><strong>Canonical codes</strong> (<code>libs/wallet_spec/codes.py</code>): <code>OK</code>, <code>DUPLICATE</code>, <code>INSUFFICIENT_FUNDS</code>,
+<code>SESSION_INVALID</code>, <code>SESSION_REPLACED</code>, <code>PLAYER_BLOCKED</code>, <code>ALREADY_SETTLED</code>, <code>IDEMPOTENCY_CONFLICT</code>,
+<code>TXN_NOT_FOUND</code>, <code>OPERATOR_TIMEOUT</code>, <code>OPERATOR_UNAVAILABLE</code>, <code>RATE_LIMITED</code>, <code>BAD_REQUEST</code>,
+<code>OPERATOR_CONFIG_ERROR</code>, <code>SIGNATURE_OR_CLOCK</code>.</p>
+<h2 id="4-endpoints-you-implement-maczo-you">4. Endpoints you implement (maczo → you)</h2>
+<p><code>POST {wallet_callback_base}{wallet_callback_prefix}/{func}</code> — always HTTP 200; body is JSON.</p>
+<table>
+<thead>
+<tr>
+<th>func</th>
+<th>body (money fields)</th>
+<th>response</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>debit</code></td>
+<td><code>operator_id, player_ref, txn_ref, round_ref, game_code, amount_minor, currency, currency_exp</code></td>
+<td><code>{status, code, duplicate, old_balance_minor, new_balance_minor, currency, currency_exp, operator_ref}</code></td>
+</tr>
+<tr>
+<td><code>credit</code></td>
+<td>+ <code>payout_minor, valid_bet_minor, ref_txn_ref</code></td>
+<td>same</td>
+</tr>
+<tr>
+<td><code>rollback</code></td>
+<td><code>amount_minor</code> (== original debit), <code>ref_txn_ref</code></td>
+<td>same</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td><code>operator_id, txn_ref</code></td>
+<td><code>{status, applied, old_balance_minor?, new_balance_minor?, currency, currency_exp}</code></td>
+</tr>
+<tr>
+<td><code>balance</code></td>
+<td><code>operator_id, player_ref, currency</code></td>
+<td><code>{status, balance_minor, currency, currency_exp}</code></td>
+</tr>
+</tbody>
+</table>
+<p>The <strong>ordering invariant</strong> maczo follows: validate session → freeze check → persist PENDING intent →
+<strong>debit you &amp; confirm APPLIED</strong> → allocate nonce → resolve → commit round → credit (or internal
+zero-credit on a loss — <strong>no <code>credit</code> call for a 0 payout</strong>) → reveal. A loss never calls you.</p>
+<h2 id="5-endpoints-you-call-you-maczo">5. Endpoints you call (you → maczo)</h2>
+<p>The launch/catalog/kick surface (<code>POST /GameLogin</code>, <code>/GetGameList</code>, <code>/KickPlayer</code>, <code>/ReplayLogin</code>) is
+verified per-operator against your registered dialect + signing key + IP allowlist. <code>/GameLogin</code> returns
+a launch <code>Url</code>; open it in an iframe/redirect. See <a href="integration.html"><code>INTEGRATION.md</code></a> §3 for the launch
+body and <a href="onboarding.html"><code>ONBOARDING.md</code></a> for the dev→prod steps.</p>
+<h2 id="6-provably-fair">6. Provably fair</h2>
+<p>Every result is re-derivable from <code>(server_seed, client_seed, nonce)</code> via
+<code>HMAC-SHA256(server_seed, "client_seed:nonce:cursor")</code>. The server-seed hash is committed before use and
+revealed on rotation. See <a href="integration.html"><code>INTEGRATION.md</code></a> §4 and the public verifier
+(<code>verify.maczo.co</code>).</p>
+<h2 id="7-go-live-checklist">7. Go-live checklist</h2>
+<ol>
+<li>Register the merchant in the maczo backoffice → get <code>operator_id</code> + a <code>key_id</code>.</li>
+<li>Implement the five wallet endpoints (§4) + verify our signature (§2).</li>
+<li>Set your <code>wallet_callback_base</code> + prefix; hand maczo your signing secret out-of-band.</li>
+<li>Test on the <strong>dev sandbox</strong> (<code>originals-api-dev.maczo.co</code>) against the <code>native-mock</code> reference merchant.</li>
+<li>maczo staff approve go-live (adds your callback FQDN to the egress allowlist) → flip <code>status:active</code>.</li>
+</ol>
+<p>See <a href="onboarding.html"><code>ONBOARDING.md</code></a> for the full self-serve flow + endpoint tables.</p></main></body></html>

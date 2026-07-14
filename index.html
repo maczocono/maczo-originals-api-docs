@@ -1,14 +1,23 @@
 <!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1"><title>maczo Originals — Merchant Docs</title>
-<style>body{margin:0;background:#0F212E;color:#cfe3f2;font-family:'Bai Jamjuree',system-ui,sans-serif}
-header{padding:18px 22px;border-bottom:1px solid #24455c}.logo{color:#1FFF20;font-weight:700}
-main{max-width:820px;margin:0 auto;padding:26px}h1{color:#fff}a{color:#1FFF20;text-decoration:none}
-.card{background:#152a3a;border:1px solid #24455c;border-radius:10px;padding:16px;margin:12px 0}
-.muted{color:#7fa0b8}</style></head><body>
-<header><span class=logo>maczo</span> Originals — Merchant Docs</header><main>
-<h1>Integrate maczo Originals</h1>
+<link href="https://fonts.googleapis.com/css2?family=Bai+Jamjuree:wght@400;600;700&display=swap" rel="stylesheet"><style>*{box-sizing:border-box}body{margin:0;background:#0F212E;color:#cfe3f2;font-family:'Bai Jamjuree',system-ui,-apple-system,'Segoe UI',sans-serif;line-height:1.55}
+a{color:#1FFF20;text-decoration:none}a:hover{text-decoration:underline}
+header.top{position:sticky;top:0;background:#152a3a;border-bottom:1px solid #24455c;padding:12px 22px}
+header.top .logo{color:#1FFF20;font-weight:700}header.top a{color:#cfe3f2}
+main{max-width:860px;margin:0 auto;padding:28px 22px 60px}
+h1,h2,h3,h4{color:#fff;line-height:1.25}h1{border-bottom:1px solid #24455c;padding-bottom:8px}
+code{background:#0a1620;border:1px solid #1b3547;border-radius:4px;padding:1px 5px;font-size:.92em}
+pre{background:#0a1620;border:1px solid #24455c;border-radius:8px;padding:14px;overflow:auto}pre code{border:0;padding:0}
+table{border-collapse:collapse;margin:14px 0;width:100%;display:block;overflow-x:auto}
+th,td{border:1px solid #24455c;padding:7px 11px;text-align:left}th{background:#152a3a;color:#fff}
+blockquote{border-left:3px solid #1475E1;margin:14px 0;padding:6px 14px;background:#152a3a;border-radius:0 6px 6px 0}
+.cards{display:grid;gap:14px}.card{background:#152a3a;border:1px solid #24455c;border-radius:12px;padding:18px}
+.card h3{margin:0 0 6px}.muted{color:#7fa0b8}</style></head><body>
+<header class=top><span class=logo>maczo ●</span> &nbsp;Originals — Merchant Docs</header>
+<main><h1>Integrate maczo Originals</h1>
 <p class=muted>Build once against the canonical <b>native</b> dialect and offer our provably-fair games.</p>
-<div class=card><h3><a href="api.html">API reference (OpenAPI / Swagger UI)</a></h3>
+<div class=cards>
+<div class=card><h3><a href="api.html">API reference (OpenAPI / Swagger UI) →</a></h3>
 <p class=muted>Interactive schemas for every dialect. Start with the canonical native seamless wallet.</p></div>
-<div class=card><h3>Guides</h3><ul><li><a href="guide.html?doc=guides/INTEGRATION.md">Integration front door</a> <span class=muted>(INTEGRATION.md)</span></li><li><a href="guide.html?doc=guides/MACZO-NATIVE-WIRE.md">Native wire contract</a> <span class=muted>(MACZO-NATIVE-WIRE.md)</span></li><li><a href="guide.html?doc=guides/ONBOARDING.md">Onboarding: dev → prod</a> <span class=muted>(ONBOARDING.md)</span></li></ul></div>
-</main></body></html>
+<div class=card><h3><a href="integration.html">Integration front door →</a></h3><p class=muted>INTEGRATION.md</p></div><div class=card><h3><a href="maczo-native-wire.html">Native wire contract →</a></h3><p class=muted>MACZO-NATIVE-WIRE.md</p></div><div class=card><h3><a href="onboarding.html">Onboarding: dev → prod →</a></h3><p class=muted>ONBOARDING.md</p></div>
+</div></main></body></html>
