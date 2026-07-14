@@ -1,0 +1,364 @@
+openapi: 3.0.3
+info:
+  title: maczo ⇄ bx Seamless Wallet API (SG / GSC+ dialect)
+  version: 1.0.0
+  description: >-
+    Seamless wallet callbacks the **maczo** game provider calls on **bx** to move money during
+    play. Wire dialect mirrors bx's SG (GamingSoft Connect+) integration — see
+    [`sg-reference.md`](./sg-reference.md). bx is the source of truth for balances; our ledger is a
+    display-only mirror.
+
+
+    **Money-safety invariants (non-negotiable — see SKILL.md §2 / §5):**
+
+    - Classify outcomes on the body `code`, **never** on the HTTP status (always `200`).
+
+    - Idempotency key = `transaction.id`. A duplicate returns `code: 1003` with the **original**
+      `before_balance`/`balance` — never re-moves money, never returns the live balance.
+
+    - Unknown / unlisted `code` ⇒ **fail-closed** (terminal, do not apply, do not blind-retry).
+
+    - The bet (`withdraw` `BET`) must be confirmed applied **before** a nonce is allocated or the
+      outcome resolved. A loss writes an internal zero-credit record — **no `deposit` call**.
+
+    - Money is decimal, floored to the wire precision at the adapter boundary; never float internally.
+
+    - Echo `wager_code` and `round_id` byte-identical on settle/refund (drives bonus-vs-real routing).
+
+
+    **Authentication.** Each request carries a `sign` field in the JSON body (Regem/SG style — not a
+    header): `sign = md5(operator_code + request_time + action + secret_key)`, lowercase hex,
+    case-insensitive constant-time compare, `request_time` within ±300 s. `action` is the endpoint
+    keyword (`getbalance` / `withdraw` / `deposit` / `pushbetdata`). The per-operator `secret_key`
+    never crosses the wire.
+servers:
+  - url: https://{bxCallbackHost}/v1/api/seamless
+    description: bx seamless callback base (host + prefix assigned by bx, per operator/environment)
+    variables:
+      bxCallbackHost:
+        default: callback.bx.example
+tags:
+  - name: wallet
+    description: Money-moving and balance callbacks (maczo → bx)
+paths:
+  /balance:
+    post:
+      operationId: getBalance
+      tags: [wallet]
+      summary: Query player balance (read-only, batch)
+      description: >-
+        Returns spendable balance (real + bonus combined; bx owns the split). `action` for the
+        signature is `getbalance`. Display only — **never** authorize a bet on this value.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BalanceRequest' }
+            example:
+              operator_code: MACZO01
+              currency: USD
+              request_time: "1623456789"
+              sign: 9b1f0c2e4a6d8f0b2c4e6a8d0f2b4c6e
+              batch_requests:
+                - { member_account: pa1b2c3d4_alice, product_code: 9001 }
+      responses:
+        '200':
+          description: Always 200; per-item `code` carries the real outcome.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BalanceResponse' }
+              example:
+                data:
+                  - { member_account: pa1b2c3d4_alice, product_code: 9001, balance: 10000.0000, code: 0, message: "" }
+  /withdraw:
+    post:
+      operationId: withdraw
+      tags: [wallet]
+      summary: Debit (place bet) — money out, batch
+      description: >-
+        Deducts stake (bonus-first, then real). `action` for the signature is `withdraw`; each
+        transaction's `action` is one of `BET`, `TIP`, `BET_PRESERVE`, `PRESERVE_REFUND`,
+        `ROLLBACK`, `ADJUSTMENT`. Idempotent on `transaction.id`. Pre-money gates return without
+        moving money (see status codes). A confirmed `BET` is the precondition for nonce allocation
+        and resolve.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferRequest' }
+            example:
+              operator_code: MACZO01
+              currency: USD
+              request_time: "1623456789"
+              sign: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6
+              batch_requests:
+                - member_account: pa1b2c3d4_alice
+                  product_code: 9001
+                  game_type: ORIGINALS
+                  transactions:
+                    - id: "1001"
+                      action: BET
+                      wager_code: w_7f3a
+                      wager_status: PENDING
+                      wager_type: NORMAL
+                      round_id: "550021"
+                      amount: 1.00
+                      bet_amount: 1.00
+                      valid_bet_amount: 1.00
+                      game_code: dice
+      responses:
+        '200':
+          description: Always 200; per-item `code` carries the real outcome.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransferResponse' }
+              example:
+                data:
+                  - { member_account: pa1b2c3d4_alice, product_code: 9001, before_balance: 10000.0000, balance: 9999.0000, code: 0, message: "" }
+  /deposit:
+    post:
+      operationId: deposit
+      tags: [wallet]
+      summary: Credit (settle win / refund) — money in, batch
+      description: >-
+        Credits a payout or refunds a bet. `action` for the signature is `deposit`; each
+        transaction's `action` is one of `SETTLED`, `JACKPOT`, `BONUS`, `PROMO`, `LEADERBOARD`,
+        `FREEBET`, `CANCEL`, `ROLLBACK`, `ADJUSTMENT`. Idempotent on `transaction.id`. Win routing
+        (real vs bonus) is decided by an active turnover lock and the bet's bonus usage matched on
+        `round_id` — so `round_id` MUST equal the original `BET`'s. `CANCEL` requires the prior
+        `BET` to exist (else `1006`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferRequest' }
+            example:
+              operator_code: MACZO01
+              currency: USD
+              request_time: "1623456790"
+              sign: f0e1d2c3b4a5968778695a4b3c2d1e0f
+              batch_requests:
+                - member_account: pa1b2c3d4_alice
+                  product_code: 9001
+                  transactions:
+                    - id: "1001-WIN"
+                      action: SETTLED
+                      wager_code: w_7f3a
+                      wager_status: SETTLED
+                      wager_type: NORMAL
+                      round_id: "550021"
+                      amount: 1.98
+                      valid_bet_amount: 1.00
+                      game_code: dice
+      responses:
+        '200':
+          description: Always 200; per-item `code` carries the real outcome.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransferResponse' }
+              example:
+                data:
+                  - { member_account: pa1b2c3d4_alice, product_code: 9001, before_balance: 9999.0000, balance: 10000.9800, code: 0, message: "" }
+  /pushbetdata:
+    post:
+      operationId: pushBetData
+      tags: [wallet]
+      summary: Sync wager metadata for reconciliation (no balance impact)
+      description: >-
+        Bulk wager upsert for reconciliation/analytics. No money moves. `action` for the signature
+        is `pushbetdata`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PushBetDataRequest' }
+      responses:
+        '200':
+          description: Accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleResponse' }
+              example: { code: 0, message: "" }
+components:
+  schemas:
+    AuthFields:
+      type: object
+      required: [operator_code, request_time, sign]
+      properties:
+        operator_code:
+          type: string
+          description: Operator id bx issues, per environment. Echoed for validation.
+          example: MACZO01
+        currency:
+          type: string
+          description: ISO currency or a scaled variant (e.g. IDR2, VND3). Defaults to USD.
+          default: USD
+        request_time:
+          type: string
+          description: Unix epoch seconds (numeric string). Must be within ±300 s of server time.
+          example: "1623456789"
+        sign:
+          type: string
+          description: 'md5(operator_code + request_time + action + secret_key), lowercase hex.'
+          example: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6
+    Decimal:
+      description: Monetary value as a decimal. Accepted on input as number or string; scaled by the currency ratio at the boundary.
+      oneOf:
+        - type: number
+        - type: string
+      example: 1.00
+    BalanceRequest:
+      allOf:
+        - $ref: '#/components/schemas/AuthFields'
+        - type: object
+          required: [batch_requests]
+          properties:
+            batch_requests:
+              type: array
+              items: { $ref: '#/components/schemas/BalanceBatchItem' }
+    BalanceBatchItem:
+      type: object
+      required: [member_account, product_code]
+      properties:
+        member_account:
+          type: string
+          description: Scoped identity '{envChar}{tenantHex8}_{username}', ≤32 chars.
+          example: pa1b2c3d4_alice
+        product_code:
+          type: integer
+          format: int32
+          example: 9001
+    BalanceResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/BalanceResponseItem' }
+    BalanceResponseItem:
+      type: object
+      required: [member_account, product_code, balance, code, message]
+      properties:
+        member_account: { type: string, example: pa1b2c3d4_alice }
+        product_code: { type: integer, format: int32, example: 9001 }
+        balance: { type: number, description: Spendable real+bonus scaled to wire currency., example: 10000.0000 }
+        code: { $ref: '#/components/schemas/StatusCode' }
+        message: { type: string, example: "" }
+    TransferRequest:
+      allOf:
+        - $ref: '#/components/schemas/AuthFields'
+        - type: object
+          required: [batch_requests]
+          properties:
+            batch_requests:
+              type: array
+              items: { $ref: '#/components/schemas/TransferBatchItem' }
+    TransferBatchItem:
+      type: object
+      required: [member_account, product_code, transactions]
+      properties:
+        member_account: { type: string, example: pa1b2c3d4_alice }
+        product_code: { type: integer, format: int32, example: 9001 }
+        game_type: { type: string, nullable: true, example: ORIGINALS }
+        transactions:
+          type: array
+          items: { $ref: '#/components/schemas/Transaction' }
+    Transaction:
+      type: object
+      required: [id, action, wager_code, wager_status, amount]
+      properties:
+        id:
+          type: string
+          description: Unique per money move. THE idempotency key (-> 'sg_'+id on bx side).
+          example: "1001"
+        action:
+          type: string
+          description: >-
+            Withdraw actions: BET, TIP, BET_PRESERVE, PRESERVE_REFUND, ROLLBACK, ADJUSTMENT.
+            Deposit actions: SETTLED, JACKPOT, BONUS, PROMO, LEADERBOARD, FREEBET, CANCEL, ROLLBACK,
+            ADJUSTMENT.
+          enum: [BET, TIP, BET_PRESERVE, PRESERVE_REFUND, ROLLBACK, ADJUSTMENT, SETTLED, JACKPOT, BONUS, PROMO, LEADERBOARD, FREEBET, CANCEL]
+          example: BET
+        wager_code:
+          type: string
+          description: Stable bet id; links bet ↔ win ↔ rollback.
+          example: w_7f3a
+        wager_status: { type: string, example: PENDING }
+        wager_type: { type: string, default: NORMAL, example: NORMAL }
+        round_id:
+          type: string
+          nullable: true
+          description: Game round; drives bonus-vs-real routing on settle. MUST match the bet's value.
+          example: "550021"
+        channel_code: { type: string, nullable: true }
+        amount: { $ref: '#/components/schemas/Decimal' }
+        bet_amount: { $ref: '#/components/schemas/Decimal' }
+        valid_bet_amount: { $ref: '#/components/schemas/Decimal' }
+        prize_amount: { $ref: '#/components/schemas/Decimal' }
+        tip_amount: { $ref: '#/components/schemas/Decimal' }
+        game_code: { type: string, nullable: true, example: dice }
+        settled_at: { type: integer, format: int64, nullable: true, description: Unix ms. }
+    TransferResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/TransferResponseItem' }
+    TransferResponseItem:
+      type: object
+      required: [member_account, product_code, before_balance, balance, code, message]
+      properties:
+        member_account: { type: string, example: pa1b2c3d4_alice }
+        product_code: { type: integer, format: int32, example: 9001 }
+        before_balance: { type: number, example: 10000.0000 }
+        balance: { type: number, description: Balance after this move (scaled)., example: 9999.0000 }
+        code: { $ref: '#/components/schemas/StatusCode' }
+        message: { type: string, example: "" }
+    PushBetDataRequest:
+      allOf:
+        - $ref: '#/components/schemas/AuthFields'
+        - type: object
+          required: [wagers]
+          properties:
+            wagers:
+              type: array
+              items: { $ref: '#/components/schemas/PushWager' }
+    PushWager:
+      type: object
+      required: [member_account, wager_code, wager_status, bet_amount, valid_bet_amount, prize_amount, settled_at, created_at]
+      properties:
+        member_account: { type: string }
+        wager_code: { type: string }
+        wager_status: { type: string }
+        wager_type: { type: string, default: NORMAL }
+        round_id: { type: string, nullable: true }
+        channel_code: { type: string, nullable: true }
+        game_type: { type: string, nullable: true }
+        product_code: { type: string, nullable: true }
+        game_code: { type: string, nullable: true }
+        currency: { type: string, nullable: true }
+        bet_amount: { type: string }
+        valid_bet_amount: { type: string }
+        prize_amount: { type: string }
+        tip_amount: { type: string }
+        settled_at: { type: integer, format: int64, description: Unix seconds. }
+        created_at: { type: integer, format: int64, description: Unix seconds. }
+        payload: { type: object, nullable: true, additionalProperties: true }
+    SimpleResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code: { $ref: '#/components/schemas/StatusCode' }
+        message: { type: string, example: "" }
+    StatusCode:
+      type: integer
+      description: >-
+        Business outcome (HTTP is always 200). 0=success; 999=server error / invalid action / parse
+        error (rolled back); 1000=member/tenant context missing (fail-closed); 1001=insufficient
+        balance; 1002=unsupported currency; 1003=duplicate id (idempotent replay → original
+        balances, no money moved); 1004=invalid signature or stale request_time; 1006=bet blocked
+        (game disabled/unknown/turnover-locked, or CANCEL with no prior bet). Any other value ⇒
+        fail-closed (terminal, do not apply, do not blind-retry).
+      enum: [0, 999, 1000, 1001, 1002, 1003, 1004, 1006]
+      example: 0

@@ -1,0 +1,261 @@
+openapi: 3.0.3
+info:
+  title: maczo NATIVE Seamless Wallet API (canonical dialect)
+  version: 1.0.0
+  description: >-
+    The **canonical seamless wallet contract a new external merchant implements**, and that the maczo
+    **wallet-adapter calls** to move money during play. This is the clean, recommended dialect (the
+    bx/Regem MD5-in-body protocol is a legacy alternative kept for existing operators).
+
+
+    Direction: **maczo (provider) → merchant (operator)**. The merchant holds the real player balance
+    and is the source of truth; maczo's ledger is a display-only mirror.
+
+
+    **Money-safety invariants (non-negotiable — see SKILL.md §2 / §5):**
+
+    - HTTP status is ALWAYS `200`. Classify the outcome on the body `code`, never on the HTTP status.
+
+    - All amounts are **integer minor units** (`amount_minor`) + `currency` (ISO-4217) + `currency_exp`
+      (minor-unit exponent). Never a float; the merchant supports the full `currency_exp` (no 2dp cap).
+
+    - Idempotency key = `txn_ref`. A duplicate returns `code: DUPLICATE`, `duplicate: true`, and the
+      **LIVE** balance — it never re-moves money.
+
+    - A `credit` (win) or `rollback` MUST reference a prior applied debit via `ref_txn_ref`; a settle
+      with no prior debit returns `code: TXN_NOT_FOUND` (never silent).
+
+    - `status` is a REAL read-only query of whether a `txn_ref` applied — it MUST NOT move money.
+
+    - Unknown / unrecognised `code` ⇒ fail closed (treated as `BAD_REQUEST`, never blind-retried).
+
+
+    **Authentication (header HMAC-SHA256).** Every request is signed with the per-merchant shared secret
+    selected by `X-Key-Id` (so a key can be rotated with an overlap window). The signature is
+    `HMAC_SHA256(secret, canonical)` where `canonical` is the newline-joined string:
+    `METHOD` + `PATH` + `X-Timestamp` + `X-Nonce` + `sha256hex(rawBody)`. Headers: `X-Signature`
+    (lowercase hex), `X-Timestamp` (unix seconds, within ±60 s), `X-Nonce` (single-use), `X-Key-Id`.
+    Reject outside the window or on a seen nonce (fail closed → `SIGNATURE_OR_CLOCK`).
+servers:
+  - url: https://{merchantWalletHost}{pathPrefix}
+    description: The merchant's seamless wallet base URL + path prefix (from the operators registry).
+    variables:
+      merchantWalletHost:
+        default: wallet.example.com
+      pathPrefix:
+        default: /seamless
+security:
+  - nativeSignature: []
+paths:
+  /debit:
+    post:
+      summary: Debit (place a bet). Idempotent on txn_ref.
+      operationId: debit
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DebitRequest" }
+      responses:
+        "200":
+          description: Always 200; outcome is in the body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MoneyResponse" }
+  /credit:
+    post:
+      summary: Credit (settle a win). Only called when payout_minor > 0. Requires ref_txn_ref.
+      operationId: credit
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreditRequest" }
+      responses:
+        "200":
+          description: Always 200; outcome is in the body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MoneyResponse" }
+  /rollback:
+    post:
+      summary: Rollback (reverse an applied debit). amount_minor MUST equal the original debit.
+      operationId: rollback
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RollbackRequest" }
+      responses:
+        "200":
+          description: Always 200; outcome is in the body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MoneyResponse" }
+  /status:
+    post:
+      summary: Read-only probe of whether a txn_ref applied (unknown-result recovery). Moves no money.
+      operationId: status
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StatusRequest" }
+      responses:
+        "200":
+          description: Always 200.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusResponse" }
+  /balance:
+    post:
+      summary: Display-only balance for a player. Never used to authorize a bet.
+      operationId: balance
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BalanceRequest" }
+      responses:
+        "200":
+          description: Always 200.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BalanceResponse" }
+components:
+  securitySchemes:
+    nativeSignature:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: >-
+        HMAC-SHA256 hex over METHOD+PATH+X-Timestamp+X-Nonce+sha256hex(body). Accompanied by the
+        X-Timestamp, X-Nonce and X-Key-Id headers (see parameters).
+  parameters:
+    SigTimestamp:
+      name: X-Timestamp
+      in: header
+      required: true
+      schema: { type: string }
+      description: Unix seconds (integer string); within ±60 s of now.
+    SigNonce:
+      name: X-Nonce
+      in: header
+      required: true
+      schema: { type: string }
+      description: Single-use opaque nonce.
+    SigKeyId:
+      name: X-Key-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: Selects the per-merchant signing key (rotation).
+  schemas:
+    Money:
+      type: object
+      required: [operator_id, player_ref, txn_ref, currency, currency_exp]
+      properties:
+        operator_id: { type: string }
+        player_ref: { type: string, description: Merchant's durable player identity. }
+        txn_ref: { type: string, description: Idempotency key for this money move. }
+        round_ref: { type: string }
+        game_code: { type: string }
+        currency: { type: string, example: USD }
+        currency_exp: { type: integer, example: 2 }
+        request_hash: { type: string }
+        meta: { type: object, additionalProperties: true }
+    DebitRequest:
+      allOf:
+        - $ref: "#/components/schemas/Money"
+        - type: object
+          required: [amount_minor]
+          properties:
+            amount_minor: { type: integer, minimum: 1, description: "Integer minor units, greater than zero." }
+    CreditRequest:
+      allOf:
+        - $ref: "#/components/schemas/Money"
+        - type: object
+          required: [payout_minor, ref_txn_ref]
+          properties:
+            payout_minor: { type: integer, minimum: 0 }
+            valid_bet_minor: { type: integer, minimum: 0, description: Turnover-eligible stake. }
+            ref_txn_ref: { type: string, description: The prior applied debit's txn_ref. }
+    RollbackRequest:
+      allOf:
+        - $ref: "#/components/schemas/Money"
+        - type: object
+          required: [amount_minor, ref_txn_ref]
+          properties:
+            amount_minor: { type: integer, minimum: 1, description: MUST equal the original debit. }
+            ref_txn_ref: { type: string }
+    StatusRequest:
+      type: object
+      required: [operator_id, txn_ref]
+      properties:
+        operator_id: { type: string }
+        txn_ref: { type: string }
+    BalanceRequest:
+      type: object
+      required: [operator_id, player_ref, currency]
+      properties:
+        operator_id: { type: string }
+        player_ref: { type: string }
+        currency: { type: string }
+    MoneyResponse:
+      type: object
+      required: [status, code, currency, currency_exp]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code:
+          type: string
+          description: Canonical WalletCode.
+          enum: [OK, DUPLICATE, INSUFFICIENT_FUNDS, SESSION_INVALID, SESSION_REPLACED, PLAYER_BLOCKED,
+                 ALREADY_SETTLED, IDEMPOTENCY_CONFLICT, TXN_NOT_FOUND, OPERATOR_TIMEOUT,
+                 OPERATOR_UNAVAILABLE, RATE_LIMITED, BAD_REQUEST, OPERATOR_CONFIG_ERROR, SIGNATURE_OR_CLOCK]
+        duplicate: { type: boolean, description: Idempotent replay — balance is the LIVE balance. }
+        old_balance_minor: { type: integer }
+        new_balance_minor: { type: integer }
+        currency: { type: string }
+        currency_exp: { type: integer }
+        operator_ref: { type: string, description: "Merchant-side id, for the ledger join." }
+        message: { type: string }
+    StatusResponse:
+      type: object
+      required: [status, applied, currency, currency_exp]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code: { type: string }
+        applied: { type: boolean, description: Whether this txn_ref is durably applied. }
+        old_balance_minor: { type: integer, nullable: true }
+        new_balance_minor: { type: integer, nullable: true }
+        currency: { type: string }
+        currency_exp: { type: integer }
+    BalanceResponse:
+      type: object
+      required: [status, balance_minor, currency, currency_exp]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code: { type: string }
+        balance_minor: { type: integer }
+        currency: { type: string }
+        currency_exp: { type: integer }

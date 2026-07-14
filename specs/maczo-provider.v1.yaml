@@ -1,0 +1,213 @@
+openapi: 3.0.3
+info:
+  title: maczo Provider API (bx → maczo) — SG / GSC+ dialect
+  version: 1.0.0
+  description: >-
+    Endpoints **maczo exposes** for bx's game connector to call: launch a game and fetch our game
+    catalog ("GameList"). This is the inbound half of the provider role, mirroring how bx's SG
+    connector calls GamingSoft — see [`sg-reference.md`](./sg-reference.md). The money path
+    (maczo → bx debit/credit) is the separate [`seamless-wallet.v1.yaml`](./seamless-wallet.v1.yaml).
+
+
+    **Authentication.** bx signs each call; maczo verifies. Signature is the **connector** recipe
+    (different field order from the wallet callbacks):
+    `sign = md5(request_time + secret_key + action + operator_code)`, lowercase hex, ±300 s window,
+    case-insensitive constant-time compare. `action` ∈ `launchgame` / `productlist` / `gamelist`.
+    On POST, `sign` + `request_time` are body fields; on GET, they are query params.
+
+
+    **Identity.** `member_account` is bx's scoped player id `{envChar}{tenantHex8}_{username}`
+    (≤32 chars) and IS the durable key — bind it to the game session at launch and echo it verbatim
+    on every wallet callback. `nickname` is the human-friendly raw username. There is no separate
+    launch token; launch = session creation (idempotent on relaunch).
+servers:
+  - url: https://{maczoHost}
+    description: maczo provider base (host assigned per operator/environment)
+    variables:
+      maczoHost:
+        default: maczo.example
+tags:
+  - name: launch
+    description: Game launch (bx → maczo)
+  - name: catalog
+    description: Product + game catalog ("GameList")
+paths:
+  /api/operators/launch-game:
+    post:
+      operationId: launchGame
+      tags: [launch]
+      summary: Launch a game session, return a playable URL
+      description: >-
+        Validates the signed request, binds `member_account` to a fresh game session, and returns
+        the player-facing `url`. `game_code` null/equal-to-product ⇒ launch the lobby. `action` for
+        the signature is `launchgame`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LaunchGameRequest' }
+            example:
+              operator_code: MACZO01
+              member_account: pa1b2c3d4_alice
+              password: 5f4dcc3b5aa765d61d8327deb882cf99
+              nickname: alice
+              currency: USD
+              game_code: dice
+              product_code: 9001
+              game_type: ORIGINALS
+              language_code: "0"
+              ip: 1.2.3.4
+              platform: WEB
+              request_time: 1623456789
+              sign: 3c2d1e0ff0e1d2c3b4a5968778695a4b
+              operator_lobby_url: https://operator.example/lobby
+      responses:
+        '200':
+          description: Always 200; `code` carries the outcome (200 = success with a `url`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LaunchGameResponse' }
+              example: { code: 200, message: "", url: "https://maczo.example/play?token=eyJ...", content: null }
+  /api/operators/available-products:
+    get:
+      operationId: getProducts
+      tags: [catalog]
+      summary: List maczo products (provider catalog)
+      description: 'Returns activated products. `action` for the signature is `productlist`.'
+      parameters:
+        - { name: operator_code, in: query, required: true, schema: { type: string }, example: MACZO01 }
+        - { name: request_time, in: query, required: true, schema: { type: integer, format: int64 }, example: 1623456789 }
+        - { name: sign, in: query, required: true, schema: { type: string }, description: 'md5(request_time + secret_key + "productlist" + operator_code)' }
+      responses:
+        '200':
+          description: Array of products.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ProductItem' }
+              example:
+                - { provider: maczo, currency: USD, status: ACTIVATED, provider_id: 1, product_id: 9001, product_code: 9001, game_type: ORIGINALS, product_name: "maczo Originals" }
+  /api/operators/provider-games:
+    get:
+      operationId: getProviderGames
+      tags: [catalog]
+      summary: List games for a product ("GameList")
+      description: 'Returns activated games for a product_code. `action` for the signature is `gamelist`.'
+      parameters:
+        - { name: product_code, in: query, required: true, schema: { type: integer, format: int32 }, example: 9001 }
+        - { name: operator_code, in: query, required: true, schema: { type: string }, example: MACZO01 }
+        - { name: request_time, in: query, required: true, schema: { type: integer, format: int64 }, example: 1623456789 }
+        - { name: sign, in: query, required: true, schema: { type: string }, description: 'md5(request_time + secret_key + "gamelist" + operator_code)' }
+        - { name: game_type, in: query, required: false, schema: { type: string }, example: ORIGINALS }
+      responses:
+        '200':
+          description: Game list with pagination.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GameListResponse' }
+              example:
+                code: 0
+                message: ""
+                provider_games:
+                  - game_code: dice
+                    game_name: Dice
+                    game_type: ORIGINALS
+                    image_url: https://maczo.example/img/dice.png
+                    product_id: 9001
+                    product_code: 9001
+                    support_currency: USD
+                    status: ACTIVATED
+                    allow_free_round: false
+                    lang_name: { "0": Dice, "3": ลูกเต๋า }
+                    lang_icon: { "0": https://maczo.example/img/dice.png }
+                    created_at: 1623456789
+                pagination: { size: 100, total: "1" }
+components:
+  schemas:
+    LaunchGameRequest:
+      type: object
+      required: [operator_code, member_account, currency, product_code, request_time, sign]
+      properties:
+        operator_code: { type: string, example: MACZO01 }
+        member_account:
+          type: string
+          description: Scoped identity '{envChar}{tenantHex8}_{username}', ≤32 chars. The durable key.
+          example: pa1b2c3d4_alice
+        password:
+          type: string
+          description: md5(member_account), lowercase hex.
+          example: 5f4dcc3b5aa765d61d8327deb882cf99
+        nickname: { type: string, description: Human-friendly raw username (display)., example: alice }
+        currency: { type: string, default: USD, example: USD }
+        game_code: { type: string, nullable: true, description: Null/equal-to-product ⇒ launch lobby., example: dice }
+        product_code: { type: integer, format: int32, example: 9001 }
+        game_type: { type: string, default: ORIGINALS, example: ORIGINALS }
+        language_code: { type: string, description: 'Numeric GSC+ language code (0=en, 3=th, ...).', example: "0" }
+        ip: { type: string, description: Player IPv4; defaults 127.0.0.1., example: 1.2.3.4 }
+        platform: { type: string, enum: [WEB, MOBILE], example: WEB }
+        widget_id: { type: string, nullable: true }
+        is_widget_login: { type: boolean, nullable: true }
+        request_time: { type: integer, format: int64, example: 1623456789 }
+        sign: { type: string, description: 'md5(request_time + secret_key + "launchgame" + operator_code)' }
+        operator_lobby_url: { type: string, nullable: true, description: Return/lobby URL., example: https://operator.example/lobby }
+    LaunchGameResponse:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: integer
+          description: '200=success (with url); 10002=invalid params; 999=internal error; message~"maintain"=maintenance.'
+          example: 200
+        message: { type: string, example: "" }
+        url: { type: string, nullable: true, description: Player-facing game URL., example: "https://maczo.example/play?token=eyJ..." }
+        content: { type: string, nullable: true, description: "Optional base64 HTML fallback (rendered as 'html:{b64}')." }
+    ProductItem:
+      type: object
+      required: [status, product_code]
+      properties:
+        provider: { type: string, example: maczo }
+        currency: { type: string, example: USD }
+        status: { type: string, description: ACTIVATED to be listed., example: ACTIVATED }
+        provider_id: { type: integer, format: int32, example: 1 }
+        product_id: { type: integer, format: int32, example: 9001 }
+        product_code: { type: integer, format: int32, description: Primary catalog key., example: 9001 }
+        game_type: { type: string, example: ORIGINALS }
+        product_name: { type: string, example: "maczo Originals" }
+    GameListResponse:
+      type: object
+      required: [code, provider_games]
+      properties:
+        code: { type: integer, example: 0 }
+        message: { type: string, example: "" }
+        provider_games:
+          type: array
+          items: { $ref: '#/components/schemas/GameItem' }
+        pagination: { $ref: '#/components/schemas/Pagination' }
+    GameItem:
+      type: object
+      required: [game_code, game_name, game_type, product_code, status]
+      properties:
+        game_code: { type: string, description: Unique game id., example: dice }
+        game_name: { type: string, example: Dice }
+        game_type: { type: string, example: ORIGINALS }
+        image_url: { type: string, example: https://maczo.example/img/dice.png }
+        product_id: { type: integer, format: int32, example: 9001 }
+        product_code: { type: integer, format: int32, example: 9001 }
+        support_currency: { type: string, example: USD }
+        status: { type: string, example: ACTIVATED }
+        allow_free_round: { type: boolean, example: false }
+        lang_name:
+          type: object
+          additionalProperties: { type: string }
+          description: Localized names keyed by GSC+ language code.
+        lang_icon:
+          type: object
+          additionalProperties: { type: string }
+          description: Localized icons keyed by GSC+ language code.
+        created_at: { type: integer, format: int64, example: 1623456789 }
+    Pagination:
+      type: object
+      properties:
+        size: { type: integer, example: 100 }
+        total: { type: string, example: "1" }
