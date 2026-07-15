@@ -1,18 +1,16 @@
 openapi: 3.0.3
 info:
-  title: maczo NATIVE Seamless Wallet API (canonical dialect)
+  title: maczo Originals — Seamless Wallet API
   version: 1.0.0
   description: >-
-    The **canonical seamless wallet contract a new external merchant implements**, and that the maczo
-    **wallet-adapter calls** to move money during play. This is the clean, recommended dialect (the
-    bx/Regem MD5-in-body protocol is a legacy alternative kept for existing operators).
+    The seamless wallet contract you (the operator) implement and maczo calls to move money during play.
 
 
-    Direction: **maczo (provider) → merchant (operator)**. The merchant holds the real player balance
-    and is the source of truth; maczo's ledger is a display-only mirror.
+    Direction: **maczo (provider) → you (operator)**. You hold the real player balance and are the source
+    of truth; maczo's ledger is a display-only mirror.
 
 
-    **Money-safety invariants (non-negotiable — see SKILL.md §2 / §5):**
+    **Money-safety invariants (non-negotiable):**
 
     - HTTP status is ALWAYS `200`. Classify the outcome on the body `code`, never on the HTTP status.
 

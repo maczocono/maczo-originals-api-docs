@@ -14,44 +14,36 @@ blockquote{border-left:3px solid #1475E1;margin:14px 0;padding:6px 14px;backgrou
 .cards{display:grid;gap:14px}.card{background:#152a3a;border:1px solid #24455c;border-radius:12px;padding:18px}
 .card h3{margin:0 0 6px}.muted{color:#7fa0b8}</style></head><body>
 <header class=top><a href="index.html"><span class=logo>maczo ●</span> Docs</a> &nbsp;·&nbsp; <a href="api.html">API reference</a></header>
-<main><h1 id="merchant-onboarding-dev-sandbox-production">Merchant onboarding — dev sandbox → production</h1>
-<p>Self-serve guide to connect an external <strong>merchant</strong> to maczo Originals as a seamless aggregator. Uses
-the <strong>canonical native dialect</strong> (<a href="maczo-native-wire.html"><code>MACZO-NATIVE-WIRE.md</code></a>); existing operators on
-the legacy bx/SG/Regem dialect follow <a ><code>ORIGINALS-BX-WIRE.md</code></a> instead.</p>
+<main><h1 id="onboarding-sandbox-production">Onboarding — sandbox → production</h1>
+<p>How to connect your platform to maczo Originals as a seamless aggregator. Full contract:
+<strong>Integration wire contract</strong> on this site; interactive schema: the <strong>API reference</strong>.</p>
 <h2 id="endpoints">Endpoints</h2>
 <table>
 <thead>
 <tr>
 <th>Surface</th>
-<th>Dev / sandbox</th>
+<th>Sandbox (dev)</th>
 <th>Production</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Merchant → us (launch / catalog / kick)</td>
+<td>You → maczo (launch / catalog / kick)</td>
 <td><code>https://originals-api-dev.maczo.co</code></td>
 <td><code>https://originals-api.maczo.co</code></td>
 </tr>
 <tr>
-<td>Merchant portal (your reports + integration)</td>
+<td>Merchant portal (your reports + settings)</td>
 <td><code>https://portal-dev.maczo.co</code></td>
 <td><code>https://portal.maczo.co</code></td>
 </tr>
 <tr>
-<td>Staff backoffice (maczo)</td>
-<td><code>https://admin-dev.maczo.co</code></td>
-<td><code>https://admin.maczo.co</code></td>
-</tr>
-<tr>
-<td>Public docs</td>
+<td>These docs</td>
 <td><code>https://docs.maczo.co</code></td>
 <td><code>https://docs.maczo.co</code></td>
 </tr>
 </tbody>
 </table>
-<p>(Dev + prod run the SAME images with the SAME env-var contract — code never branches on environment;
-only config/registry data differs.)</p>
 <h2 id="what-you-provide-what-maczo-provides">What you provide / what maczo provides</h2>
 <table>
 <thead>
@@ -62,50 +54,40 @@ only config/registry data differs.)</p>
 </thead>
 <tbody>
 <tr>
-<td><code>operator_id</code>, a <code>key_id</code>, the launch/catalog endpoints, the games catalog (<code>/GetGameList</code>)</td>
-<td>Your <strong>wallet callback base URL</strong> + path prefix (<code>{base}{prefix}/debit|credit|rollback|status|balance</code>)</td>
+<td><code>operator_id</code>, a signing <code>key_id</code>, the launch/catalog endpoints, the games catalog</td>
+<td>Your <strong>wallet callback base URL</strong> (<code>{yourWalletBase}{prefix}</code>) that we call</td>
 </tr>
 <tr>
-<td>The native wire contract + OpenAPI + the <code>native-mock</code> reference merchant</td>
-<td>Your <strong>signing secret</strong> (handed to maczo out-of-band, never on the wire)</td>
+<td>The wire contract + interactive API reference + a sandbox to test against</td>
+<td>Your <strong>signing secret</strong> (exchanged out-of-band, never on the wire)</td>
 </tr>
 <tr>
-<td>Dev sandbox + a staff go-live approval</td>
-<td>Your inbound <strong>IP allowlist</strong> (hosts that call our launch surface)</td>
+<td>Sandbox + a go-live approval</td>
+<td>Your inbound <strong>IP allowlist</strong> (hosts that call our launch API)</td>
 </tr>
 </tbody>
 </table>
 <h2 id="steps">Steps</h2>
 <ol>
-<li><strong>Register</strong> — maczo staff onboard your merchant in the backoffice (<code>admin[-dev].maczo.co</code>):
-   <code>operator_id</code>, <code>dialect: native</code>, base currency + allowed currencies, allowed games, commission
-   terms. You receive portal credentials (<code>merchant-admin</code>).</li>
-<li><strong>Get a key</strong> — in the portal (or via staff), add a signing <code>key_id</code>; hand maczo the secret
-   out-of-band (it is stored only by reference, never in plaintext).</li>
-<li><strong>Implement the wallet</strong> — the five endpoints in <a href="maczo-native-wire.html"><code>MACZO-NATIVE-WIRE.md</code></a> §4,
-   verifying our header-HMAC signature (§2). Validate the OpenAPI:
-   <code>python -m openapi_spec_validator docs/wallet-api/maczo-native-seamless.v1.yaml</code>.</li>
-<li><strong>Set your callback</strong> — in the portal, set <code>wallet_callback_base</code> + prefix and your inbound IP
-   allowlist.</li>
-<li><strong>Test on the sandbox</strong> — point at <code>originals-api-dev.maczo.co</code>. maczo runs a <code>sandbox</code> test-merchant
-   backed by <code>native-mock</code> (tools/native-mock) so you can drive launch → bet → settle → reveal end-to-end
-   and confirm your wallet honors idempotency (<code>txn_ref</code>), insufficient-funds, and <code>status</code>.
-   The local money stack (<code>deploy/compose/docker-compose.dev.yml</code>) brings up the full path + a
-   <code>native-mock</code> merchant if you want to test entirely offline.</li>
-<li><strong>Go-live approval (staff)</strong> — maczo adds your <code>callback_fqdn</code> to the production egress allowlist
-   (only <code>wallet-adapter</code> egresses to merchants) and flips your <code>status: active</code>. Self-service handles
-   credentials + config; production egress + enablement stay staff-approved.</li>
-<li><strong>Reconcile</strong> — use the portal reports (GGR / turnover / RTP-actual / settlement) and your own ledger
-   to reconcile daily; commission statements are per your configured basis — <strong>GGR (the merchant's win
-   = bets − payouts) by default</strong>, or turnover / player-payouts.</li>
+<li><strong>Register.</strong> We onboard your operator and issue your <code>operator_id</code> + a signing <code>key_id</code>. You receive
+   portal credentials.</li>
+<li><strong>Implement the seamless wallet</strong> — the five endpoints in the <strong>Integration wire contract</strong> §2,
+   verifying our HMAC-SHA256 header signature (§3).</li>
+<li><strong>Configure your side</strong> in the portal: your wallet callback base URL + your inbound IP allowlist.</li>
+<li><strong>Test on the sandbox</strong> — point at <code>https://originals-api-dev.maczo.co</code> and run launch → bet → settle
+   → reveal end-to-end. Confirm your wallet honours idempotency (<code>txn_ref</code>), insufficient-funds, and
+   <code>status</code>.</li>
+<li><strong>Go live.</strong> We approve production; your operator flips to active and your callback host is enabled
+   for production traffic.</li>
+<li><strong>Reconcile.</strong> Use the portal reports (GGR / turnover / RTP-actual / settlement) against your own
+   ledger; commission statements are produced per your agreed basis.</li>
 </ol>
-<h2 id="money-safety-you-can-rely-on">Money-safety you can rely on</h2>
+<h2 id="what-you-can-rely-on">What you can rely on</h2>
 <ul>
-<li>The <strong>operator (you) is the source of truth for money</strong>; maczo never authorizes a bet on a computed
-  balance. Every money move is idempotent on a server-derived <code>txn_ref</code> (double idempotency: our unique
-  index AND your idempotency key).</li>
-<li>Strict <strong>ordering invariant</strong> (debit confirmed before any nonce is burned or outcome revealed); a loss
-  writes an internal zero-credit and does <strong>not</strong> call your wallet.</li>
-<li>Every outcome is <strong>provably fair</strong> and re-derivable; commission is a billing figure computed on
-  aggregated totals, <strong>never</strong> deducted from a player payout.</li>
+<li><strong>You are the source of truth for money</strong> — we never authorise a bet on a computed balance. Every
+  money move is idempotent on a server-derived <code>txn_ref</code> (both sides dedupe).</li>
+<li><strong>Strict ordering</strong> — the stake is confirmed applied before any outcome is drawn or revealed; a losing
+  round never calls your wallet.</li>
+<li>Every outcome is <strong>provably fair</strong> and independently verifiable. Commission is a billing figure
+  computed from aggregated totals — never deducted from a player's payout.</li>
 </ul></main></body></html>
