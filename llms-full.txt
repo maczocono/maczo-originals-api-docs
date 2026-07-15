@@ -1,0 +1,435 @@
+# maczo Originals — complete merchant integration reference (single file)
+
+This one file contains everything needed to integrate maczo Originals as a seamless aggregator:
+the onboarding steps, the wire contract (both call directions + HMAC signing + money model), and the
+full OpenAPI specification of the seamless wallet you implement. Intended for one-shot reading by an AI.
+
+Base URLs:  sandbox https://originals-api-dev.maczo.co  ·  production https://originals-api.maczo.co
+Portal:     https://portal-dev.maczo.co (sandbox)  ·  https://portal.maczo.co (production)
+Docs:       https://docs.maczo.co
+
+================================================================================
+
+# maczo Originals — Integration wire contract
+
+The exact contract to integrate maczo Originals into your platform. You do two things: **call our launch
+API** to open a game for a player, and **implement a seamless wallet** that we call to move money during
+play. Everything is JSON, signed with HMAC-SHA256 headers, and uses integer minor units.
+
+Machine-readable schema: the **API reference** on this site (Swagger UI). Interactive.
+
+## 1. Roles & directions
+
+- **maczo** = game provider. We run the provably-fair games + UI.
+- **you (the operator)** = the source of truth for the player's balance. Our ledger is a display-only
+  mirror; we never authorise a bet against a balance we computed — your wallet decides.
+
+```
+(1) LAUNCH + CATALOG      you  ──▶  maczo     open a game for a player · sync the game list · end a session
+(2) SEAMLESS WALLET       maczo ──▶ you       debit the stake · credit the win · rollback · status · balance
+```
+
+## 2. Endpoints
+
+**You call maczo** at your assigned base URL:
+
+| Environment | Base URL |
+|---|---|
+| Sandbox (dev) | `https://originals-api-dev.maczo.co` |
+| Production | `https://originals-api.maczo.co` |
+
+| `POST {base}` | Purpose |
+|---|---|
+| `/GameLogin` | Open a game session for a player; returns a playable URL |
+| `/GetGameList` | Fetch the catalog of games you may offer |
+| `/KickPlayer` | End a player's live session(s) |
+| `/ReplayLogin` | Open a read-only replay of one settled round (support/disputes) |
+
+**maczo calls you** at the wallet callback base URL you register (`{yourWalletBase}{prefix}`):
+
+| `POST` | Purpose |
+|---|---|
+| `/debit` | Place a bet (idempotent on `txn_ref`) |
+| `/credit` | Settle a win (references the debit via `ref_txn_ref`) |
+| `/rollback` | Reverse an applied debit |
+| `/status` | Read-only: has a `txn_ref` applied? (unknown-result recovery) |
+| `/balance` | Display-only balance for a player |
+
+The full request/response schema for the wallet you implement is in the **API reference** on this site.
+
+## 3. Authentication — HMAC-SHA256 headers
+
+Both directions are signed the same way, with the shared secret you exchange with us (versioned by
+`X-Key-Id`, so keys can be rotated with an overlap window):
+
+- `X-Signature` — `HMAC_SHA256(secret, canonical)`, lowercase hex
+- `X-Timestamp` — unix seconds; within ±60 s of now
+- `X-Nonce` — single-use opaque value (reject a seen nonce)
+- `X-Key-Id` — selects the signing key
+
+`canonical` is the newline-joined string (no trailing newline):
+
+```
+METHOD
+PATH
+X-Timestamp
+X-Nonce
+sha256hex(rawBody)      # sha256 of the exact request body bytes; empty body -> sha256("")
+```
+
+Reject anything outside the window or with a replayed nonce (fail closed → `SIGNATURE_OR_CLOCK`).
+
+## 4. Money model (non-negotiable)
+
+- **HTTP status is always `200`.** Classify the outcome on the body `code`, never on the HTTP status.
+- Amounts are **integer minor units** (`amount_minor`) + `currency` (ISO-4217) + `currency_exp`
+  (minor-unit exponent). Never a float; full precision (e.g. 8-dp crypto) is supported.
+- **Idempotency key = `txn_ref`.** A duplicate returns `code: DUPLICATE`, `duplicate: true`, and the
+  **live** balance — it never re-moves money.
+- A `credit` (win) or `rollback` MUST reference a prior applied debit via `ref_txn_ref`; a settle with no
+  prior debit returns `code: TXN_NOT_FOUND` (never silent). A losing round is settled internally and does
+  **not** call your wallet.
+- `status(txn_ref)` is a **read-only** query — it must never move money.
+- Unknown / unrecognised `code` ⇒ fail closed (treat as `BAD_REQUEST`).
+
+**Result codes:** `OK`, `DUPLICATE`, `INSUFFICIENT_FUNDS`, `SESSION_INVALID`, `SESSION_REPLACED`,
+`PLAYER_BLOCKED`, `ALREADY_SETTLED`, `IDEMPOTENCY_CONFLICT`, `TXN_NOT_FOUND`, `OPERATOR_TIMEOUT`,
+`OPERATOR_UNAVAILABLE`, `RATE_LIMITED`, `BAD_REQUEST`, `OPERATOR_CONFIG_ERROR`, `SIGNATURE_OR_CLOCK`.
+
+## 5. Ordering guarantee
+
+Every bet follows a strict order so money is never at risk: validate the session → **debit your wallet
+and confirm it applied** → draw the provably-fair outcome → commit the round → credit any win → reveal
+the result to the player. A rejected or unfunded bet never draws an outcome, and a win is never shown for
+an unfunded bet.
+
+## 6. Provably fair
+
+Every result is re-derivable from `(server_seed, client_seed, nonce)` via
+`HMAC-SHA256(server_seed, "client_seed:nonce:cursor")`. The server-seed hash is committed before use and
+revealed on rotation, so any player or you can independently verify any round.
+
+## 7. Go-live checklist
+
+1. We register your operator and issue your `operator_id` + a signing `key_id`; you send us your secret
+   out-of-band.
+2. Implement the five wallet endpoints (§2) and verify our signature (§3).
+3. Set your wallet callback base URL + your inbound IP allowlist in the portal.
+4. Test on the **sandbox** (`https://originals-api-dev.maczo.co`) end-to-end: launch → bet → settle →
+   reveal, confirming your wallet honours idempotency, insufficient-funds, and `status`.
+5. We approve go-live → your operator flips to active on production.
+
+See **Onboarding** on this site for the step-by-step.
+
+================================================================================
+
+# Onboarding — sandbox → production
+
+How to connect your platform to maczo Originals as a seamless aggregator. Full contract:
+**Integration wire contract** on this site; interactive schema: the **API reference**.
+
+## Endpoints
+
+| Surface | Sandbox (dev) | Production |
+|---|---|---|
+| You → maczo (launch / catalog / kick) | `https://originals-api-dev.maczo.co` | `https://originals-api.maczo.co` |
+| Merchant portal (your reports + settings) | `https://portal-dev.maczo.co` | `https://portal.maczo.co` |
+| These docs | `https://docs.maczo.co` | `https://docs.maczo.co` |
+
+## What you provide / what maczo provides
+
+| maczo provides | you provide |
+|---|---|
+| `operator_id`, a signing `key_id`, the launch/catalog endpoints, the games catalog | Your **wallet callback base URL** (`{yourWalletBase}{prefix}`) that we call |
+| The wire contract + interactive API reference + a sandbox to test against | Your **signing secret** (exchanged out-of-band, never on the wire) |
+| Sandbox + a go-live approval | Your inbound **IP allowlist** (hosts that call our launch API) |
+
+## Steps
+
+1. **Register.** We onboard your operator and issue your `operator_id` + a signing `key_id`. You receive
+   portal credentials.
+2. **Implement the seamless wallet** — the five endpoints in the **Integration wire contract** §2,
+   verifying our HMAC-SHA256 header signature (§3).
+3. **Configure your side** in the portal: your wallet callback base URL + your inbound IP allowlist.
+4. **Test on the sandbox** — point at `https://originals-api-dev.maczo.co` and run launch → bet → settle
+   → reveal end-to-end. Confirm your wallet honours idempotency (`txn_ref`), insufficient-funds, and
+   `status`.
+5. **Go live.** We approve production; your operator flips to active and your callback host is enabled
+   for production traffic.
+6. **Reconcile.** Use the portal reports (GGR / turnover / RTP-actual / settlement) against your own
+   ledger; commission statements are produced per your agreed basis.
+
+## What you can rely on
+
+- **You are the source of truth for money** — we never authorise a bet on a computed balance. Every
+  money move is idempotent on a server-derived `txn_ref` (both sides dedupe).
+- **Strict ordering** — the stake is confirmed applied before any outcome is drawn or revealed; a losing
+  round never calls your wallet.
+- Every outcome is **provably fair** and independently verifiable. Commission is a billing figure
+  computed from aggregated totals — never deducted from a player's payout.
+
+================================================================================
+
+# OpenAPI specification — maczo-native-seamless.v1.yaml
+
+```yaml
+openapi: 3.0.3
+info:
+  title: maczo Originals — Seamless Wallet API
+  version: 1.0.0
+  description: >-
+    The seamless wallet contract you (the operator) implement and maczo calls to move money during play.
+
+
+    Direction: **maczo (provider) → you (operator)**. You hold the real player balance and are the source
+    of truth; maczo's ledger is a display-only mirror.
+
+
+    **Money-safety invariants (non-negotiable):**
+
+    - HTTP status is ALWAYS `200`. Classify the outcome on the body `code`, never on the HTTP status.
+
+    - All amounts are **integer minor units** (`amount_minor`) + `currency` (ISO-4217) + `currency_exp`
+      (minor-unit exponent). Never a float; the merchant supports the full `currency_exp` (no 2dp cap).
+
+    - Idempotency key = `txn_ref`. A duplicate returns `code: DUPLICATE`, `duplicate: true`, and the
+      **LIVE** balance — it never re-moves money.
+
+    - A `credit` (win) or `rollback` MUST reference a prior applied debit via `ref_txn_ref`; a settle
+      with no prior debit returns `code: TXN_NOT_FOUND` (never silent).
+
+    - `status` is a REAL read-only query of whether a `txn_ref` applied — it MUST NOT move money.
+
+    - Unknown / unrecognised `code` ⇒ fail closed (treated as `BAD_REQUEST`, never blind-retried).
+
+
+    **Authentication (header HMAC-SHA256).** Every request is signed with the per-merchant shared secret
+    selected by `X-Key-Id` (so a key can be rotated with an overlap window). The signature is
+    `HMAC_SHA256(secret, canonical)` where `canonical` is the newline-joined string:
+    `METHOD` + `PATH` + `X-Timestamp` + `X-Nonce` + `sha256hex(rawBody)`. Headers: `X-Signature`
+    (lowercase hex), `X-Timestamp` (unix seconds, within ±60 s), `X-Nonce` (single-use), `X-Key-Id`.
+    Reject outside the window or on a seen nonce (fail closed → `SIGNATURE_OR_CLOCK`).
+servers:
+  - url: https://{merchantWalletHost}{pathPrefix}
+    description: The merchant's seamless wallet base URL + path prefix (from the operators registry).
+    variables:
+      merchantWalletHost:
+        default: wallet.example.com
+      pathPrefix:
+        default: /seamless
+security:
+  - nativeSignature: []
+paths:
+  /debit:
+    post:
+      summary: Debit (place a bet). Idempotent on txn_ref.
+      operationId: debit
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DebitRequest" }
+      responses:
+        "200":
+          description: Always 200; outcome is in the body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MoneyResponse" }
+  /credit:
+    post:
+      summary: Credit (settle a win). Only called when payout_minor > 0. Requires ref_txn_ref.
+      operationId: credit
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreditRequest" }
+      responses:
+        "200":
+          description: Always 200; outcome is in the body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MoneyResponse" }
+  /rollback:
+    post:
+      summary: Rollback (reverse an applied debit). amount_minor MUST equal the original debit.
+      operationId: rollback
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RollbackRequest" }
+      responses:
+        "200":
+          description: Always 200; outcome is in the body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MoneyResponse" }
+  /status:
+    post:
+      summary: Read-only probe of whether a txn_ref applied (unknown-result recovery). Moves no money.
+      operationId: status
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StatusRequest" }
+      responses:
+        "200":
+          description: Always 200.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusResponse" }
+  /balance:
+    post:
+      summary: Display-only balance for a player. Never used to authorize a bet.
+      operationId: balance
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BalanceRequest" }
+      responses:
+        "200":
+          description: Always 200.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BalanceResponse" }
+components:
+  securitySchemes:
+    nativeSignature:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: >-
+        HMAC-SHA256 hex over METHOD+PATH+X-Timestamp+X-Nonce+sha256hex(body). Accompanied by the
+        X-Timestamp, X-Nonce and X-Key-Id headers (see parameters).
+  parameters:
+    SigTimestamp:
+      name: X-Timestamp
+      in: header
+      required: true
+      schema: { type: string }
+      description: Unix seconds (integer string); within ±60 s of now.
+    SigNonce:
+      name: X-Nonce
+      in: header
+      required: true
+      schema: { type: string }
+      description: Single-use opaque nonce.
+    SigKeyId:
+      name: X-Key-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: Selects the per-merchant signing key (rotation).
+  schemas:
+    Money:
+      type: object
+      required: [operator_id, player_ref, txn_ref, currency, currency_exp]
+      properties:
+        operator_id: { type: string }
+        player_ref: { type: string, description: Merchant's durable player identity. }
+        txn_ref: { type: string, description: Idempotency key for this money move. }
+        round_ref: { type: string }
+        game_code: { type: string }
+        currency: { type: string, example: USD }
+        currency_exp: { type: integer, example: 2 }
+        request_hash: { type: string }
+        meta: { type: object, additionalProperties: true }
+    DebitRequest:
+      allOf:
+        - $ref: "#/components/schemas/Money"
+        - type: object
+          required: [amount_minor]
+          properties:
+            amount_minor: { type: integer, minimum: 1, description: "Integer minor units, greater than zero." }
+    CreditRequest:
+      allOf:
+        - $ref: "#/components/schemas/Money"
+        - type: object
+          required: [payout_minor, ref_txn_ref]
+          properties:
+            payout_minor: { type: integer, minimum: 0 }
+            valid_bet_minor: { type: integer, minimum: 0, description: Turnover-eligible stake. }
+            ref_txn_ref: { type: string, description: The prior applied debit's txn_ref. }
+    RollbackRequest:
+      allOf:
+        - $ref: "#/components/schemas/Money"
+        - type: object
+          required: [amount_minor, ref_txn_ref]
+          properties:
+            amount_minor: { type: integer, minimum: 1, description: MUST equal the original debit. }
+            ref_txn_ref: { type: string }
+    StatusRequest:
+      type: object
+      required: [operator_id, txn_ref]
+      properties:
+        operator_id: { type: string }
+        txn_ref: { type: string }
+    BalanceRequest:
+      type: object
+      required: [operator_id, player_ref, currency]
+      properties:
+        operator_id: { type: string }
+        player_ref: { type: string }
+        currency: { type: string }
+    MoneyResponse:
+      type: object
+      required: [status, code, currency, currency_exp]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code:
+          type: string
+          description: Canonical WalletCode.
+          enum: [OK, DUPLICATE, INSUFFICIENT_FUNDS, SESSION_INVALID, SESSION_REPLACED, PLAYER_BLOCKED,
+                 ALREADY_SETTLED, IDEMPOTENCY_CONFLICT, TXN_NOT_FOUND, OPERATOR_TIMEOUT,
+                 OPERATOR_UNAVAILABLE, RATE_LIMITED, BAD_REQUEST, OPERATOR_CONFIG_ERROR, SIGNATURE_OR_CLOCK]
+        duplicate: { type: boolean, description: Idempotent replay — balance is the LIVE balance. }
+        old_balance_minor: { type: integer }
+        new_balance_minor: { type: integer }
+        currency: { type: string }
+        currency_exp: { type: integer }
+        operator_ref: { type: string, description: "Merchant-side id, for the ledger join." }
+        message: { type: string }
+    StatusResponse:
+      type: object
+      required: [status, applied, currency, currency_exp]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code: { type: string }
+        applied: { type: boolean, description: Whether this txn_ref is durably applied. }
+        old_balance_minor: { type: integer, nullable: true }
+        new_balance_minor: { type: integer, nullable: true }
+        currency: { type: string }
+        currency_exp: { type: integer }
+    BalanceResponse:
+      type: object
+      required: [status, balance_minor, currency, currency_exp]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code: { type: string }
+        balance_minor: { type: integer }
+        currency: { type: string }
+        currency_exp: { type: integer }
+```

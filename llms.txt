@@ -1,0 +1,17 @@
+# maczo Originals — Merchant Integration
+
+> Provably-fair casino games offered through a seamless wallet aggregation. You call our launch API to
+> open a game for a player, and you implement a seamless wallet we call to move money during play.
+> Everything is JSON, signed with HMAC-SHA256 headers, integer minor units + currency + currency_exp.
+> Sandbox base URL: https://originals-api-dev.maczo.co · Production base URL: https://originals-api.maczo.co
+> Merchant portal: https://portal-dev.maczo.co (sandbox) / https://portal.maczo.co (production). Docs: https://docs.maczo.co
+
+## Read these to integrate
+
+- [Onboarding](https://docs.maczo.co/onboarding.html): sandbox to production, what you provide vs. what maczo provides, steps.
+- [Integration wire contract](https://docs.maczo.co/maczo-native-wire.html): both call directions, HMAC header signing, money model, ordering guarantee, provably-fair.
+- [OpenAPI specification (raw YAML)](https://docs.maczo.co/specs/maczo-native-seamless.v1.yaml): machine-readable schema of the seamless wallet you implement.
+
+## One file for AI
+
+- [Complete single-file reference](https://docs.maczo.co/llms-full.txt): everything above concatenated into one plain-text document — hand this URL to an AI to integrate in one shot.
