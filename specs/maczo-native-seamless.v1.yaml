@@ -61,6 +61,27 @@ info:
 
     `X-Signature` is a **per-request computed HMAC**, not a static credential — a generated client needs a
     signing hook, not a fixed header value.
+
+
+    **Result `code` — when you return each** (the rest are codes *we* may send you, handle as errors):
+
+    - `OK` — applied successfully.
+
+    - `DUPLICATE` — same `txn_ref` **and** same request seen before: replay, `duplicate:true`, live balance.
+
+    - `IDEMPOTENCY_CONFLICT` — same `txn_ref` but a **different** amount/currency/player: reject, apply nothing.
+
+    - `INSUFFICIENT_FUNDS` — debit exceeds the player's balance.
+
+    - `TXN_NOT_FOUND` — `credit`/`rollback` whose `ref_txn_ref` has no applied debit.
+
+    - `ALREADY_SETTLED` — a `credit` for a round you have already settled.
+
+    - `PLAYER_BLOCKED` — the player is blocked/self-excluded on your side.
+
+    - `BAD_REQUEST` — malformed/missing fields, or an unrecognised `code` you received (fail closed).
+
+    - `SIGNATURE_OR_CLOCK` — signature/timestamp/nonce check failed (see Authentication).
 servers:
   - url: https://{merchantWalletHost}{pathPrefix}
     description: The merchant's seamless wallet base URL + path prefix (from the operators registry).
