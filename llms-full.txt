@@ -45,6 +45,13 @@ Machine-readable schema: the **API reference** on this site (Swagger UI). Intera
 | `/KickPlayer` | End a player's live session(s) |
 | `/ReplayLogin` | Open a read-only replay of one settled round (support/disputes) |
 
+These are JSON, signed with the same header HMAC as the wallet callbacks (§3), and always answer HTTP
+`200` — classify on the body `code` (`OK` / `OPERATOR_CONFIG_ERROR` / `BAD_REQUEST` /
+`SIGNATURE_OR_CLOCK`). The exact request/response bodies are in the **Launch & Catalog API** reference on
+this site. `player_ref` is your durable player id (charset `A-Za-z0-9._$?-`, length 1–50) and is echoed
+**verbatim** on every wallet callback. `game_code` is an `originals_<id>` value from `/GetGameList`,
+passed back to `/GameLogin`.
+
 **maczo calls you** at the wallet callback base URL you register (`{yourWalletBase}{prefix}`):
 
 | `POST` | Purpose |
@@ -109,14 +116,31 @@ Every result is re-derivable from `(server_seed, client_seed, nonce)` via
 `HMAC-SHA256(server_seed, "client_seed:nonce:cursor")`. The server-seed hash is committed before use and
 revealed on rotation, so any player or you can independently verify any round.
 
-## 7. Go-live checklist
+## 7. Signing keys & the shared secret
 
-1. We register your operator and issue your `operator_id` + a signing `key_id`; you send us your secret
-   out-of-band.
-2. Implement the five wallet endpoints (§2) and verify our signature (§3).
-3. Set your wallet callback base URL + your inbound IP allowlist in the portal.
-4. Test on the **sandbox** (`https://originals-api-dev.maczo.co`) end-to-end: launch → bet → settle →
-   reveal, confirming your wallet honours idempotency, insufficient-funds, and `status`.
+- **You generate the secret** (e.g. 32 random bytes as hex) and send it to us **out-of-band** (never on
+  the wire). We register your `operator_id` and a `key_id`; you present that `key_id` as `X-Key-Id`.
+- The secret is used as its **raw UTF-8 bytes** in `HMAC_SHA256(secret, canonical)` — we do **not**
+  hex- or base64-decode it first. Whatever string we exchange is the key material verbatim.
+- **Rotation:** we can hold more than one active key for you; sign with the new `key_id` while the old
+  one still verifies during the overlap, then we retire the old one.
+
+## 8. Callback registration
+
+You register (in the portal, or we set it at onboarding) your **wallet callback base URL** and a **path
+prefix** (default `/seamless`). We call `{base}{prefix}/debit`, `/credit`, etc. The signed `PATH` in the
+HMAC canonical is exactly **`{prefix}/{func}`** (e.g. `/seamless/debit`) — the scheme/host are **not**
+signed, so your prefix must match on both sides. You also register an inbound **IP allowlist** for the
+hosts that call our launch API.
+
+## 9. Go-live checklist
+
+1. We register your operator + `key_id`; you send your secret out-of-band (§7).
+2. Implement the five wallet endpoints (Seamless Wallet API) and verify our signature (§3).
+3. Set your wallet callback base URL + path prefix + inbound IP allowlist (§8).
+4. Test on the **sandbox** (`https://originals-api-dev.maczo.co`) end-to-end: `/GameLogin` → open the
+   returned URL → place a bet → your wallet receives `debit` then `credit`/no-call-on-loss → reveal.
+   Confirm your wallet honours idempotency (`txn_ref`), insufficient-funds, and `status`.
 5. We approve go-live → your operator flips to active on production.
 
 See **Onboarding** on this site for the step-by-step.
@@ -140,20 +164,32 @@ How to connect your platform to maczo Originals as a seamless aggregator. Full c
 
 | maczo provides | you provide |
 |---|---|
-| `operator_id`, a signing `key_id`, the launch/catalog endpoints, the games catalog | Your **wallet callback base URL** (`{yourWalletBase}{prefix}`) that we call |
-| The wire contract + interactive API reference + a sandbox to test against | Your **signing secret** (exchanged out-of-band, never on the wire) |
+| `operator_id`, a signing `key_id`, the launch/catalog endpoints, the games catalog | Your **wallet callback base URL** + path prefix (`{yourWalletBase}{prefix}`) that we call |
+| The wire contract + interactive API reference + a sandbox to test against | Your **signing secret** (you generate it; exchanged out-of-band, never on the wire) |
 | Sandbox + a go-live approval | Your inbound **IP allowlist** (hosts that call our launch API) |
+
+### The shared secret (important)
+
+**You generate the HMAC secret** (e.g. `openssl rand -hex 32`) and send it to us out-of-band. maczo
+issues the `operator_id` + `key_id`; the secret value never travels on the wire and is not entered
+through any UI. It is used as its **raw UTF-8 bytes** in `HMAC_SHA256(secret, canonical)` — not
+hex/base64-decoded. maczo provisions your secret before your operator can go active; until then wallet
+calls fail closed with `OPERATOR_CONFIG_ERROR`. Keys can be rotated with an overlap window (`X-Key-Id`).
 
 ## Steps
 
 1. **Register.** We onboard your operator and issue your `operator_id` + a signing `key_id`. You receive
    portal credentials.
-2. **Implement the seamless wallet** — the five endpoints in the **Integration wire contract** §2,
-   verifying our HMAC-SHA256 header signature (§3).
-3. **Configure your side** in the portal: your wallet callback base URL + your inbound IP allowlist.
-4. **Test on the sandbox** — point at `https://originals-api-dev.maczo.co` and run launch → bet → settle
-   → reveal end-to-end. Confirm your wallet honours idempotency (`txn_ref`), insufficient-funds, and
-   `status`.
+2. **Implement the seamless wallet** — the five endpoints in the **Seamless Wallet API**, verifying our
+   HMAC-SHA256 header signature. Then call our **Launch & Catalog API** (`/GameLogin`, `/GetGameList`,
+   `/KickPlayer`, `/ReplayLogin`) signed the same way — one signing routine for both directions.
+3. **Configure your side** in the portal: your wallet callback base URL + **path prefix** (default
+   `/seamless`; the signed path is `{prefix}/{func}`) + your inbound IP allowlist.
+4. **Test on the sandbox** — point at `https://originals-api-dev.maczo.co`: `/GameLogin` → open the
+   returned URL → place a bet → your wallet receives `debit`, then `credit` on a win (a loss never calls
+   your wallet). Confirm idempotency (a replayed `txn_ref` returns `duplicate:true`, money moves once),
+   insufficient-funds, and the read-only `status(txn_ref)`. Your wallet is the source of the balance, so
+   you fund the test player on your side (maczo never mints funds).
 5. **Go live.** We approve production; your operator flips to active and your callback host is enabled
    for production traffic.
 6. **Reconcile.** Use the portal reports (GGR / turnover / RTP-actual / settlement) against your own
@@ -432,4 +468,283 @@ components:
         balance_minor: { type: integer }
         currency: { type: string }
         currency_exp: { type: integer }
+```
+
+# OpenAPI specification — maczo-launch.v1.yaml
+
+```yaml
+openapi: 3.0.3
+info:
+  title: maczo Originals — Launch & Catalog API
+  version: 1.0.0
+  description: >-
+    The endpoints **you (the operator) call on maczo** to open a game for a player and to sync the game
+    catalogue. This is the inbound half of the integration; the money half (maczo → your wallet) is the
+    separate **Seamless Wallet API**.
+
+
+    Direction: **you (operator) → maczo (provider)**. Every call is JSON and is signed with the SAME
+    header-HMAC scheme as the wallet callbacks (see *Authentication*), so you implement one signing
+    routine for both directions.
+
+
+    **Conventions (non-negotiable):**
+
+    - HTTP status is ALWAYS `200`. Classify the outcome on the body `code`, never on the HTTP status.
+
+    - `player_ref` is YOUR durable player identity (charset `A-Za-z0-9._$?-`, length 1–50). maczo binds
+      it to the game session and echoes it **verbatim** on every wallet callback (`player_ref`). maczo
+      never invents or transforms a player id.
+
+    - `game_code` is exactly a value returned by `/GetGameList` (`originals_<id>`), passed back to
+      `/GameLogin`. There is one product (`originals`).
+
+    - Money is settled by the wallet callbacks in integer minor units; nothing here moves money.
+
+
+    **Authentication (header HMAC-SHA256).** Identical to the Seamless Wallet API. Each request carries
+    `X-Signature` (lowercase hex of `HMAC_SHA256(secret, canonical)`), `X-Timestamp` (unix seconds,
+    within ±60 s), `X-Nonce` (single-use), and `X-Key-Id` (selects your signing key, for rotation).
+    `canonical` is the newline-joined string `METHOD` + `PATH` + `X-Timestamp` + `X-Nonce` +
+    `sha256hex(rawBody)`. `PATH` is the path only (no query string); an empty body hashes as
+    `sha256("")`. The secret is used as its raw UTF-8 bytes (not hex/base64-decoded). Reject-and-fail
+    closed outside the window or on a replayed nonce (`code: SIGNATURE_OR_CLOCK`).
+servers:
+  - url: https://originals-api-dev.maczo.co
+    description: Sandbox (dev)
+  - url: https://originals-api.maczo.co
+    description: Production
+security:
+  - nativeSignature: []
+paths:
+  /GameLogin:
+    post:
+      summary: Open a game session for a player; returns a playable URL.
+      operationId: gameLogin
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GameLoginRequest" }
+            example:
+              operator_id: gpx_dev
+              player_ref: pa1b2c3d4_alice
+              currency: THB
+              game_code: originals_dice
+              platform: WEB
+              lobby_url: https://operator.example/lobby
+      responses:
+        "200":
+          description: Always 200; outcome is in the body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaunchResponse" }
+              example: { status: ok, code: OK, url: "https://originals-dev.maczo.co/embed/originals_dice?session=eyJ..." }
+  /GetGameList:
+    post:
+      summary: Fetch the catalogue of games you may offer.
+      operationId: getGameList
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GetGameListRequest" }
+            example: { operator_id: gpx_dev }
+      responses:
+        "200":
+          description: Always 200; the catalogue is in `games`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GameListResponse" }
+              example:
+                status: ok
+                code: OK
+                games:
+                  - game_code: originals_dice
+                    name: Dice
+                    category: ORIGINALS
+                    provider: originals
+                    image_url: https://originals-api-dev.maczo.co/img/tiles/dice.png?v=ab12cd34ef
+                    active: true
+                    has_demo: true
+                    interactive: false
+                    live: false
+  /KickPlayer:
+    post:
+      summary: End a player's live session(s). A fresh launch after a kick works normally.
+      operationId: kickPlayer
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/KickPlayerRequest" }
+            example: { operator_id: gpx_dev, player_ref: pa1b2c3d4_alice }
+      responses:
+        "200":
+          description: Always 200.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleResponse" }
+              example: { status: ok, code: OK }
+  /ReplayLogin:
+    post:
+      summary: Open a read-only replay of one settled round (support / disputes).
+      operationId: replayLogin
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReplayLoginRequest" }
+            example:
+              operator_id: gpx_dev
+              player_ref: pa1b2c3d4_alice
+              round_ref: "a1b2c3d4e5f6...(the round_ref maczo returned on settle)"
+              game_code: originals_dice
+      responses:
+        "200":
+          description: Always 200; a read-only replay URL (never a betting session).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaunchResponse" }
+              example: { status: ok, code: OK, url: "https://originals-dev.maczo.co/embed/originals_dice?replay=eyJ..." }
+components:
+  securitySchemes:
+    nativeSignature:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: >-
+        HMAC-SHA256 hex over METHOD+PATH+X-Timestamp+X-Nonce+sha256hex(body). Accompanied by
+        X-Timestamp, X-Nonce and X-Key-Id (see parameters). Same scheme as the Seamless Wallet API.
+  parameters:
+    SigTimestamp:
+      name: X-Timestamp
+      in: header
+      required: true
+      schema: { type: string }
+      description: Unix seconds (integer string); within ±60 s of now.
+    SigNonce:
+      name: X-Nonce
+      in: header
+      required: true
+      schema: { type: string }
+      description: Single-use opaque nonce.
+    SigKeyId:
+      name: X-Key-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: Selects your signing key (rotation).
+  schemas:
+    GameLoginRequest:
+      type: object
+      required: [operator_id, player_ref]
+      properties:
+        operator_id: { type: string, description: Your maczo operator id., example: gpx_dev }
+        player_ref:
+          type: string
+          description: Your durable player identity (charset A-Za-z0-9._$?-, length 1–50). Echoed verbatim on every wallet callback.
+          example: pa1b2c3d4_alice
+        currency:
+          type: string
+          description: The player's wallet currency; must be in your enabled currencies. Defaults to your base currency.
+          example: THB
+        game_code:
+          type: string
+          description: An originals_<id> value from GetGameList. Omit to open a default game.
+          example: originals_dice
+        language: { type: string, description: "Optional UI language hint (e.g. th, en).", example: th }
+        platform: { type: string, enum: [WEB, MOBILE], example: WEB }
+        lobby_url: { type: string, nullable: true, description: Return/lobby URL., example: https://operator.example/lobby }
+        demo: { type: boolean, description: "Open a free fun-play session (no wallet, no money path).", default: false }
+        currency_exp:
+          type: integer
+          description: Minor-unit exponent — only needed for a wallet currency outside maczo's known table.
+          example: 2
+        exchange_rate:
+          type: string
+          nullable: true
+          description: Optional USD-per-unit display rate for a currency maczo doesn't statically know.
+        meta: { type: object, additionalProperties: true, description: Optional passthrough. }
+    GetGameListRequest:
+      type: object
+      required: [operator_id]
+      properties:
+        operator_id: { type: string, example: gpx_dev }
+    KickPlayerRequest:
+      type: object
+      required: [operator_id, player_ref]
+      properties:
+        operator_id: { type: string, example: gpx_dev }
+        player_ref: { type: string, example: pa1b2c3d4_alice }
+    ReplayLoginRequest:
+      type: object
+      required: [operator_id, player_ref, round_ref]
+      properties:
+        operator_id: { type: string, example: gpx_dev }
+        player_ref: { type: string, example: pa1b2c3d4_alice }
+        round_ref:
+          type: string
+          description: The round_ref maczo returned on settle (equals the bet's txn_ref for single-shot rounds).
+        game_code: { type: string, description: The round's game (originals_<id>)., example: originals_dice }
+    LaunchResponse:
+      type: object
+      required: [status, code]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code: { $ref: "#/components/schemas/LaunchCode" }
+        url: { type: string, nullable: true, description: Player-facing game/replay URL (present when code=OK). }
+        message: { type: string, nullable: true }
+    GameListResponse:
+      type: object
+      required: [status, code, games]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code: { $ref: "#/components/schemas/LaunchCode" }
+        games:
+          type: array
+          items: { $ref: "#/components/schemas/GameItem" }
+    SimpleResponse:
+      type: object
+      required: [status, code]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code: { $ref: "#/components/schemas/LaunchCode" }
+        message: { type: string, nullable: true }
+    GameItem:
+      type: object
+      required: [game_code, name, category, image_url, active]
+      properties:
+        game_code: { type: string, description: Pass this back to /GameLogin., example: originals_dice }
+        name: { type: string, example: Dice }
+        category: { type: string, example: ORIGINALS }
+        provider: { type: string, example: originals }
+        image_url: { type: string, description: Cover tile (versioned; safe to cache by URL)., example: https://originals-api-dev.maczo.co/img/tiles/dice.png?v=ab12cd34ef }
+        active: { type: boolean, example: true }
+        has_demo: { type: boolean, example: true }
+        interactive: { type: boolean, description: Multi-step game (start/step/cashout)., example: false }
+        live: { type: boolean, description: Shared-timed multiplayer round., example: false }
+    LaunchCode:
+      type: string
+      description: >-
+        Outcome code. `OK` = success. `OPERATOR_CONFIG_ERROR` = unknown/suspended operator or inbound IP
+        not allowlisted. `BAD_REQUEST` = invalid player_ref / unknown game_code / currency not enabled.
+        `SIGNATURE_OR_CLOCK` = bad/stale signature, timestamp outside window, or replayed nonce.
+      enum: [OK, OPERATOR_CONFIG_ERROR, BAD_REQUEST, SIGNATURE_OR_CLOCK]
 ```

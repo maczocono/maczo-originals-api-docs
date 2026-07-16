@@ -1,0 +1,274 @@
+openapi: 3.0.3
+info:
+  title: maczo Originals — Launch & Catalog API
+  version: 1.0.0
+  description: >-
+    The endpoints **you (the operator) call on maczo** to open a game for a player and to sync the game
+    catalogue. This is the inbound half of the integration; the money half (maczo → your wallet) is the
+    separate **Seamless Wallet API**.
+
+
+    Direction: **you (operator) → maczo (provider)**. Every call is JSON and is signed with the SAME
+    header-HMAC scheme as the wallet callbacks (see *Authentication*), so you implement one signing
+    routine for both directions.
+
+
+    **Conventions (non-negotiable):**
+
+    - HTTP status is ALWAYS `200`. Classify the outcome on the body `code`, never on the HTTP status.
+
+    - `player_ref` is YOUR durable player identity (charset `A-Za-z0-9._$?-`, length 1–50). maczo binds
+      it to the game session and echoes it **verbatim** on every wallet callback (`player_ref`). maczo
+      never invents or transforms a player id.
+
+    - `game_code` is exactly a value returned by `/GetGameList` (`originals_<id>`), passed back to
+      `/GameLogin`. There is one product (`originals`).
+
+    - Money is settled by the wallet callbacks in integer minor units; nothing here moves money.
+
+
+    **Authentication (header HMAC-SHA256).** Identical to the Seamless Wallet API. Each request carries
+    `X-Signature` (lowercase hex of `HMAC_SHA256(secret, canonical)`), `X-Timestamp` (unix seconds,
+    within ±60 s), `X-Nonce` (single-use), and `X-Key-Id` (selects your signing key, for rotation).
+    `canonical` is the newline-joined string `METHOD` + `PATH` + `X-Timestamp` + `X-Nonce` +
+    `sha256hex(rawBody)`. `PATH` is the path only (no query string); an empty body hashes as
+    `sha256("")`. The secret is used as its raw UTF-8 bytes (not hex/base64-decoded). Reject-and-fail
+    closed outside the window or on a replayed nonce (`code: SIGNATURE_OR_CLOCK`).
+servers:
+  - url: https://originals-api-dev.maczo.co
+    description: Sandbox (dev)
+  - url: https://originals-api.maczo.co
+    description: Production
+security:
+  - nativeSignature: []
+paths:
+  /GameLogin:
+    post:
+      summary: Open a game session for a player; returns a playable URL.
+      operationId: gameLogin
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GameLoginRequest" }
+            example:
+              operator_id: gpx_dev
+              player_ref: pa1b2c3d4_alice
+              currency: THB
+              game_code: originals_dice
+              platform: WEB
+              lobby_url: https://operator.example/lobby
+      responses:
+        "200":
+          description: Always 200; outcome is in the body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaunchResponse" }
+              example: { status: ok, code: OK, url: "https://originals-dev.maczo.co/embed/originals_dice?session=eyJ..." }
+  /GetGameList:
+    post:
+      summary: Fetch the catalogue of games you may offer.
+      operationId: getGameList
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GetGameListRequest" }
+            example: { operator_id: gpx_dev }
+      responses:
+        "200":
+          description: Always 200; the catalogue is in `games`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GameListResponse" }
+              example:
+                status: ok
+                code: OK
+                games:
+                  - game_code: originals_dice
+                    name: Dice
+                    category: ORIGINALS
+                    provider: originals
+                    image_url: https://originals-api-dev.maczo.co/img/tiles/dice.png?v=ab12cd34ef
+                    active: true
+                    has_demo: true
+                    interactive: false
+                    live: false
+  /KickPlayer:
+    post:
+      summary: End a player's live session(s). A fresh launch after a kick works normally.
+      operationId: kickPlayer
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/KickPlayerRequest" }
+            example: { operator_id: gpx_dev, player_ref: pa1b2c3d4_alice }
+      responses:
+        "200":
+          description: Always 200.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleResponse" }
+              example: { status: ok, code: OK }
+  /ReplayLogin:
+    post:
+      summary: Open a read-only replay of one settled round (support / disputes).
+      operationId: replayLogin
+      parameters:
+        - $ref: "#/components/parameters/SigTimestamp"
+        - $ref: "#/components/parameters/SigNonce"
+        - $ref: "#/components/parameters/SigKeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReplayLoginRequest" }
+            example:
+              operator_id: gpx_dev
+              player_ref: pa1b2c3d4_alice
+              round_ref: "a1b2c3d4e5f6...(the round_ref maczo returned on settle)"
+              game_code: originals_dice
+      responses:
+        "200":
+          description: Always 200; a read-only replay URL (never a betting session).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaunchResponse" }
+              example: { status: ok, code: OK, url: "https://originals-dev.maczo.co/embed/originals_dice?replay=eyJ..." }
+components:
+  securitySchemes:
+    nativeSignature:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: >-
+        HMAC-SHA256 hex over METHOD+PATH+X-Timestamp+X-Nonce+sha256hex(body). Accompanied by
+        X-Timestamp, X-Nonce and X-Key-Id (see parameters). Same scheme as the Seamless Wallet API.
+  parameters:
+    SigTimestamp:
+      name: X-Timestamp
+      in: header
+      required: true
+      schema: { type: string }
+      description: Unix seconds (integer string); within ±60 s of now.
+    SigNonce:
+      name: X-Nonce
+      in: header
+      required: true
+      schema: { type: string }
+      description: Single-use opaque nonce.
+    SigKeyId:
+      name: X-Key-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: Selects your signing key (rotation).
+  schemas:
+    GameLoginRequest:
+      type: object
+      required: [operator_id, player_ref]
+      properties:
+        operator_id: { type: string, description: Your maczo operator id., example: gpx_dev }
+        player_ref:
+          type: string
+          description: Your durable player identity (charset A-Za-z0-9._$?-, length 1–50). Echoed verbatim on every wallet callback.
+          example: pa1b2c3d4_alice
+        currency:
+          type: string
+          description: The player's wallet currency; must be in your enabled currencies. Defaults to your base currency.
+          example: THB
+        game_code:
+          type: string
+          description: An originals_<id> value from GetGameList. Omit to open a default game.
+          example: originals_dice
+        language: { type: string, description: "Optional UI language hint (e.g. th, en).", example: th }
+        platform: { type: string, enum: [WEB, MOBILE], example: WEB }
+        lobby_url: { type: string, nullable: true, description: Return/lobby URL., example: https://operator.example/lobby }
+        demo: { type: boolean, description: "Open a free fun-play session (no wallet, no money path).", default: false }
+        currency_exp:
+          type: integer
+          description: Minor-unit exponent — only needed for a wallet currency outside maczo's known table.
+          example: 2
+        exchange_rate:
+          type: string
+          nullable: true
+          description: Optional USD-per-unit display rate for a currency maczo doesn't statically know.
+        meta: { type: object, additionalProperties: true, description: Optional passthrough. }
+    GetGameListRequest:
+      type: object
+      required: [operator_id]
+      properties:
+        operator_id: { type: string, example: gpx_dev }
+    KickPlayerRequest:
+      type: object
+      required: [operator_id, player_ref]
+      properties:
+        operator_id: { type: string, example: gpx_dev }
+        player_ref: { type: string, example: pa1b2c3d4_alice }
+    ReplayLoginRequest:
+      type: object
+      required: [operator_id, player_ref, round_ref]
+      properties:
+        operator_id: { type: string, example: gpx_dev }
+        player_ref: { type: string, example: pa1b2c3d4_alice }
+        round_ref:
+          type: string
+          description: The round_ref maczo returned on settle (equals the bet's txn_ref for single-shot rounds).
+        game_code: { type: string, description: The round's game (originals_<id>)., example: originals_dice }
+    LaunchResponse:
+      type: object
+      required: [status, code]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code: { $ref: "#/components/schemas/LaunchCode" }
+        url: { type: string, nullable: true, description: Player-facing game/replay URL (present when code=OK). }
+        message: { type: string, nullable: true }
+    GameListResponse:
+      type: object
+      required: [status, code, games]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code: { $ref: "#/components/schemas/LaunchCode" }
+        games:
+          type: array
+          items: { $ref: "#/components/schemas/GameItem" }
+    SimpleResponse:
+      type: object
+      required: [status, code]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        code: { $ref: "#/components/schemas/LaunchCode" }
+        message: { type: string, nullable: true }
+    GameItem:
+      type: object
+      required: [game_code, name, category, image_url, active]
+      properties:
+        game_code: { type: string, description: Pass this back to /GameLogin., example: originals_dice }
+        name: { type: string, example: Dice }
+        category: { type: string, example: ORIGINALS }
+        provider: { type: string, example: originals }
+        image_url: { type: string, description: Cover tile (versioned; safe to cache by URL)., example: https://originals-api-dev.maczo.co/img/tiles/dice.png?v=ab12cd34ef }
+        active: { type: boolean, example: true }
+        has_demo: { type: boolean, example: true }
+        interactive: { type: boolean, description: Multi-step game (start/step/cashout)., example: false }
+        live: { type: boolean, description: Shared-timed multiplayer round., example: false }
+    LaunchCode:
+      type: string
+      description: >-
+        Outcome code. `OK` = success. `OPERATOR_CONFIG_ERROR` = unknown/suspended operator or inbound IP
+        not allowlisted. `BAD_REQUEST` = invalid player_ref / unknown game_code / currency not enabled.
+        `SIGNATURE_OR_CLOCK` = bad/stale signature, timestamp outside window, or replayed nonce.
+      enum: [OK, OPERATOR_CONFIG_ERROR, BAD_REQUEST, SIGNATURE_OR_CLOCK]

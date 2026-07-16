@@ -74,6 +74,12 @@ play. Everything is JSON, signed with HMAC-SHA256 headers, and uses integer mino
 </tr>
 </tbody>
 </table>
+<p>These are JSON, signed with the same header HMAC as the wallet callbacks (§3), and always answer HTTP
+<code>200</code> — classify on the body <code>code</code> (<code>OK</code> / <code>OPERATOR_CONFIG_ERROR</code> / <code>BAD_REQUEST</code> /
+<code>SIGNATURE_OR_CLOCK</code>). The exact request/response bodies are in the <strong>Launch &amp; Catalog API</strong> reference on
+this site. <code>player_ref</code> is your durable player id (charset <code>A-Za-z0-9._$?-</code>, length 1–50) and is echoed
+<strong>verbatim</strong> on every wallet callback. <code>game_code</code> is an <code>originals_&lt;id&gt;</code> value from <code>/GetGameList</code>,
+passed back to <code>/GameLogin</code>.</p>
 <p><strong>maczo calls you</strong> at the wallet callback base URL you register (<code>{yourWalletBase}{prefix}</code>):</p>
 <table>
 <thead>
@@ -148,14 +154,29 @@ an unfunded bet.</p>
 <p>Every result is re-derivable from <code>(server_seed, client_seed, nonce)</code> via
 <code>HMAC-SHA256(server_seed, "client_seed:nonce:cursor")</code>. The server-seed hash is committed before use and
 revealed on rotation, so any player or you can independently verify any round.</p>
-<h2 id="7-go-live-checklist">7. Go-live checklist</h2>
+<h2 id="7-signing-keys-the-shared-secret">7. Signing keys &amp; the shared secret</h2>
+<ul>
+<li><strong>You generate the secret</strong> (e.g. 32 random bytes as hex) and send it to us <strong>out-of-band</strong> (never on
+  the wire). We register your <code>operator_id</code> and a <code>key_id</code>; you present that <code>key_id</code> as <code>X-Key-Id</code>.</li>
+<li>The secret is used as its <strong>raw UTF-8 bytes</strong> in <code>HMAC_SHA256(secret, canonical)</code> — we do <strong>not</strong>
+  hex- or base64-decode it first. Whatever string we exchange is the key material verbatim.</li>
+<li><strong>Rotation:</strong> we can hold more than one active key for you; sign with the new <code>key_id</code> while the old
+  one still verifies during the overlap, then we retire the old one.</li>
+</ul>
+<h2 id="8-callback-registration">8. Callback registration</h2>
+<p>You register (in the portal, or we set it at onboarding) your <strong>wallet callback base URL</strong> and a <strong>path
+prefix</strong> (default <code>/seamless</code>). We call <code>{base}{prefix}/debit</code>, <code>/credit</code>, etc. The signed <code>PATH</code> in the
+HMAC canonical is exactly <strong><code>{prefix}/{func}</code></strong> (e.g. <code>/seamless/debit</code>) — the scheme/host are <strong>not</strong>
+signed, so your prefix must match on both sides. You also register an inbound <strong>IP allowlist</strong> for the
+hosts that call our launch API.</p>
+<h2 id="9-go-live-checklist">9. Go-live checklist</h2>
 <ol>
-<li>We register your operator and issue your <code>operator_id</code> + a signing <code>key_id</code>; you send us your secret
-   out-of-band.</li>
-<li>Implement the five wallet endpoints (§2) and verify our signature (§3).</li>
-<li>Set your wallet callback base URL + your inbound IP allowlist in the portal.</li>
-<li>Test on the <strong>sandbox</strong> (<code>https://originals-api-dev.maczo.co</code>) end-to-end: launch → bet → settle →
-   reveal, confirming your wallet honours idempotency, insufficient-funds, and <code>status</code>.</li>
+<li>We register your operator + <code>key_id</code>; you send your secret out-of-band (§7).</li>
+<li>Implement the five wallet endpoints (Seamless Wallet API) and verify our signature (§3).</li>
+<li>Set your wallet callback base URL + path prefix + inbound IP allowlist (§8).</li>
+<li>Test on the <strong>sandbox</strong> (<code>https://originals-api-dev.maczo.co</code>) end-to-end: <code>/GameLogin</code> → open the
+   returned URL → place a bet → your wallet receives <code>debit</code> then <code>credit</code>/no-call-on-loss → reveal.
+   Confirm your wallet honours idempotency (<code>txn_ref</code>), insufficient-funds, and <code>status</code>.</li>
 <li>We approve go-live → your operator flips to active on production.</li>
 </ol>
 <p>See <strong>Onboarding</strong> on this site for the step-by-step.</p></main></body></html>

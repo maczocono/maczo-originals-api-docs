@@ -55,11 +55,11 @@ blockquote{border-left:3px solid #1475E1;margin:14px 0;padding:6px 14px;backgrou
 <tbody>
 <tr>
 <td><code>operator_id</code>, a signing <code>key_id</code>, the launch/catalog endpoints, the games catalog</td>
-<td>Your <strong>wallet callback base URL</strong> (<code>{yourWalletBase}{prefix}</code>) that we call</td>
+<td>Your <strong>wallet callback base URL</strong> + path prefix (<code>{yourWalletBase}{prefix}</code>) that we call</td>
 </tr>
 <tr>
 <td>The wire contract + interactive API reference + a sandbox to test against</td>
-<td>Your <strong>signing secret</strong> (exchanged out-of-band, never on the wire)</td>
+<td>Your <strong>signing secret</strong> (you generate it; exchanged out-of-band, never on the wire)</td>
 </tr>
 <tr>
 <td>Sandbox + a go-live approval</td>
@@ -67,16 +67,26 @@ blockquote{border-left:3px solid #1475E1;margin:14px 0;padding:6px 14px;backgrou
 </tr>
 </tbody>
 </table>
+<h3 id="the-shared-secret-important">The shared secret (important)</h3>
+<p><strong>You generate the HMAC secret</strong> (e.g. <code>openssl rand -hex 32</code>) and send it to us out-of-band. maczo
+issues the <code>operator_id</code> + <code>key_id</code>; the secret value never travels on the wire and is not entered
+through any UI. It is used as its <strong>raw UTF-8 bytes</strong> in <code>HMAC_SHA256(secret, canonical)</code> — not
+hex/base64-decoded. maczo provisions your secret before your operator can go active; until then wallet
+calls fail closed with <code>OPERATOR_CONFIG_ERROR</code>. Keys can be rotated with an overlap window (<code>X-Key-Id</code>).</p>
 <h2 id="steps">Steps</h2>
 <ol>
 <li><strong>Register.</strong> We onboard your operator and issue your <code>operator_id</code> + a signing <code>key_id</code>. You receive
    portal credentials.</li>
-<li><strong>Implement the seamless wallet</strong> — the five endpoints in the <strong>Integration wire contract</strong> §2,
-   verifying our HMAC-SHA256 header signature (§3).</li>
-<li><strong>Configure your side</strong> in the portal: your wallet callback base URL + your inbound IP allowlist.</li>
-<li><strong>Test on the sandbox</strong> — point at <code>https://originals-api-dev.maczo.co</code> and run launch → bet → settle
-   → reveal end-to-end. Confirm your wallet honours idempotency (<code>txn_ref</code>), insufficient-funds, and
-   <code>status</code>.</li>
+<li><strong>Implement the seamless wallet</strong> — the five endpoints in the <strong>Seamless Wallet API</strong>, verifying our
+   HMAC-SHA256 header signature. Then call our <strong>Launch &amp; Catalog API</strong> (<code>/GameLogin</code>, <code>/GetGameList</code>,
+   <code>/KickPlayer</code>, <code>/ReplayLogin</code>) signed the same way — one signing routine for both directions.</li>
+<li><strong>Configure your side</strong> in the portal: your wallet callback base URL + <strong>path prefix</strong> (default
+   <code>/seamless</code>; the signed path is <code>{prefix}/{func}</code>) + your inbound IP allowlist.</li>
+<li><strong>Test on the sandbox</strong> — point at <code>https://originals-api-dev.maczo.co</code>: <code>/GameLogin</code> → open the
+   returned URL → place a bet → your wallet receives <code>debit</code>, then <code>credit</code> on a win (a loss never calls
+   your wallet). Confirm idempotency (a replayed <code>txn_ref</code> returns <code>duplicate:true</code>, money moves once),
+   insufficient-funds, and the read-only <code>status(txn_ref)</code>. Your wallet is the source of the balance, so
+   you fund the test player on your side (maczo never mints funds).</li>
 <li><strong>Go live.</strong> We approve production; your operator flips to active and your callback host is enabled
    for production traffic.</li>
 <li><strong>Reconcile.</strong> Use the portal reports (GGR / turnover / RTP-actual / settlement) against your own
