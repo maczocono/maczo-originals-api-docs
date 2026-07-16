@@ -86,22 +86,102 @@ sha256hex(rawBody)      # sha256 of the exact request body bytes; empty body -> 
 
 Reject anything outside the window or with a replayed nonce (fail closed → `SIGNATURE_OR_CLOCK`).
 
+**Rules that catch most integration bugs:**
+
+- `PATH` is the **path only, no query string**. On the wallet callbacks you verify, it is the full path
+  **including your prefix** — e.g. `/seamless/debit` (not `/debit`).
+- `X-Timestamp` is unix **seconds**, not milliseconds — do **not** use `Date.now()` (13 digits fails
+  every time). Keep your clock NTP-synced within 60 s.
+- The secret is used as its **raw UTF-8 bytes** — not hex/base64-decoded. `METHOD` is upper-case; the
+  signature is lowercase hex; compare in constant time.
+- Hash the **raw bytes as received**, before any JSON parsing. Do **not** parse-then-re-serialize to
+  compute the body hash — a change in key order or whitespace breaks the signature.
+- Money idempotency is always the body `txn_ref`, **never** the transport `X-Nonce`. A retry of the same
+  money move carries the **same `txn_ref`** but a **new** nonce/timestamp/signature. You only need to
+  remember a nonce for ~2× the freshness window (older ones fail the clock check anyway).
+
+**Worked example** (verify your signer against this exact vector):
+
+```
+secret     = "s3cr3t-sample-key"          # raw UTF-8 bytes
+METHOD     = POST
+PATH       = /seamless/debit
+X-Timestamp= 1735732800
+X-Nonce    = 9f8e7d6c5b4a39281706f5e4d3c2b1a0
+body       = {"operator_id":"acme","player_ref":"pa1b2c3d4_alice","txn_ref":"3f2a...(64 hex)","round_ref":"3f2a...(64 hex)","game_code":"originals_dice","amount_minor":100000,"currency":"THB","currency_exp":2}
+sha256hex(body) = 4f378774511b191ff84c8b4a094cf92842bae0d5cec260165a6d8bf2db56a0a0
+canonical  = "POST\n/seamless/debit\n1735732800\n9f8e7d6c5b4a39281706f5e4d3c2b1a0\n4f378774511b191ff84c8b4a094cf92842bae0d5cec260165a6d8bf2db56a0a0"
+X-Signature= 8193277c573a073a6ed3426c73bf4ddf20b061e90b242e5e7229215cb57d6e0a
+```
+
+(An empty body hashes as `sha256("")` = `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.)
+
 ## 4. Money model (non-negotiable)
 
-- **HTTP status is always `200`.** Classify the outcome on the body `code`, never on the HTTP status.
-- Amounts are **integer minor units** (`amount_minor`) + `currency` (ISO-4217) + `currency_exp`
-  (minor-unit exponent). Never a float; full precision (e.g. 8-dp crypto) is supported.
-- **Idempotency key = `txn_ref`.** A duplicate returns `code: DUPLICATE`, `duplicate: true`, and the
-  **live** balance — it never re-moves money.
-- A `credit` (win) or `rollback` MUST reference a prior applied debit via `ref_txn_ref`; a settle with no
-  prior debit returns `code: TXN_NOT_FOUND` (never silent). A losing round is settled internally and does
-  **not** call your wallet.
-- `status(txn_ref)` is a **read-only** query — it must never move money.
+- **A processed request always answers HTTP `200`** — classify the outcome on the body `code`, never on
+  the HTTP status. (Two *transport* exceptions on calls **to us**: rate limiting → HTTP `429`
+  `{code:"RATE_LIMITED", retryable:true}` with a `Retry-After` header, and an internal error → HTTP
+  `500` `{code:"INTERNAL", retryable:true}`. Retry those with backoff. Your wallet, in turn, should
+  always answer `200`; we handle your timeouts/5xx as `OPERATOR_TIMEOUT`/`OPERATOR_UNAVAILABLE`.)
+- Money is **integer minor units** + `currency` + `currency_exp` (the currency's minor-unit exponent).
+  **Never a float.** See §4a for the supported currencies and their exponents.
+- **`currency_exp` is present and authoritative on every money callback** — always scale to the exact
+  `currency_exp` we send; never hard-code a currency's decimals.
+- **Amounts fit a 64-bit integer.** At `currency_exp: 8` (crypto) a balance/turnover can exceed
+  JavaScript's `2^53` safe-integer limit — parse and emit every `*_minor` field as a **64-bit integer /
+  big-integer**, never as a float or JS `Number`.
+- **Idempotency key = `txn_ref`** (we derive it; you never mint it — store it **unique**):
+  - same `txn_ref` **and same request** → replay: return `code: DUPLICATE`, `duplicate: true`, and the
+    **live** balance in **both** `old_balance_minor` and `new_balance_minor`; move money **once**.
+  - same `txn_ref` but a **different** amount/currency/player → `code: IDEMPOTENCY_CONFLICT`; do **not**
+    apply (we send `request_hash` you may use to detect this).
+- A `credit` (win) or `rollback` MUST reference the prior applied debit via `ref_txn_ref`; a settle with
+  no matching debit returns `code: TXN_NOT_FOUND` (never silent). **A losing round never calls your
+  wallet.** A debit is settled by **at most one** `credit` **or** one `rollback` — never both.
+- `status(txn_ref)` is a **read-only** query keyed by `txn_ref` alone (no `player_ref`). `txn_ref` is
+  globally unique per operator — key your ledger/dedup by `txn_ref`, not per-player — so `status` can
+  resolve it. It returns `applied: true|false` and moves no money.
 - Unknown / unrecognised `code` ⇒ fail closed (treat as `BAD_REQUEST`).
 
-**Result codes:** `OK`, `DUPLICATE`, `INSUFFICIENT_FUNDS`, `SESSION_INVALID`, `SESSION_REPLACED`,
-`PLAYER_BLOCKED`, `ALREADY_SETTLED`, `IDEMPOTENCY_CONFLICT`, `TXN_NOT_FOUND`, `OPERATOR_TIMEOUT`,
-`OPERATOR_UNAVAILABLE`, `RATE_LIMITED`, `BAD_REQUEST`, `OPERATOR_CONFIG_ERROR`, `SIGNATURE_OR_CLOCK`.
+**Result codes** (you return these on your wallet; classify on `code`): `OK`, `DUPLICATE`,
+`INSUFFICIENT_FUNDS`, `SESSION_INVALID`, `SESSION_REPLACED`, `PLAYER_BLOCKED`, `ALREADY_SETTLED`,
+`IDEMPOTENCY_CONFLICT`, `TXN_NOT_FOUND`, `OPERATOR_TIMEOUT`, `OPERATOR_UNAVAILABLE`, `RATE_LIMITED`,
+`BAD_REQUEST`, `OPERATOR_CONFIG_ERROR`, `SIGNATURE_OR_CLOCK`.
+
+## 4a. Currencies, settlement & limits
+
+**Settlement currency — the key fact.** We call your wallet (`debit`/`credit`/`rollback`/`balance`) in the
+**exact currency you launch the session with** — your enabled currency (e.g. **THB**, or **USDT**). There
+is **no FX on the wire**: `amount_minor` is in your currency's minor units at its `currency_exp`, and every
+response you return is in that same currency/exponent. You do not receive USD and you do not convert.
+
+**Supported currencies + exponents** (maczo is authoritative — for a supported currency you may omit
+`currency_exp` at launch; we ignore a supplied one and stamp the authoritative value on every callback):
+
+| Kind | `currency` codes | `currency_exp` |
+|---|---|---|
+| Fiat (2 dp) | USD, EUR, GBP, THB, SGD, MYR, PHP, INR, IDR, BRL, MXN, AUD, CNY, HKD | `2` |
+| Fiat (0 dp) | JPY, KRW, VND | `0` |
+| Crypto / stablecoin | USDT, USDC, DAI, BTC, ETH, BNB, SOL, TRX, TON, XRP, DOGE, LTC | `8` |
+
+`currency` is the **ISO-4217 code** for fiat and maczo's **symbol** for crypto (e.g. `USDT`, `BTC`, `ETH`
+— not ISO). The **0-dp fiats are a common trap**: `amount_minor: 500` in JPY is ¥500 (not ¥5). Your
+enabled currencies are provisioned during onboarding (see the Onboarding guide) — a launch with a currency
+outside your enabled set is rejected `BAD_REQUEST`.
+
+**Examples across exponents** (the launch currency flows unchanged into every callback):
+
+```
+฿1,000.00 THB (exp 2)  ->  { "amount_minor": 100000,        "currency": "THB",  "currency_exp": 2 }
+¥1,000    JPY (exp 0)  ->  { "amount_minor": 1000,          "currency": "JPY",  "currency_exp": 0 }
+0.00100000 BTC (exp 8) ->  { "amount_minor": 100000,        "currency": "BTC",  "currency_exp": 8 }
+12.34567890 USDT       ->  { "amount_minor": 1234567890,    "currency": "USDT", "currency_exp": 8 }
+```
+
+**Bet limits.** Each game has a min-bet, max-bet, and max-win, enforced **per settlement currency**
+(auto-derived, RTP-safe, floored to the currency's exponent) — a bet below the min is rejected
+`BET_TOO_SMALL`, above the max `BET_TOO_LARGE`, and a win above the cap is clipped. You don't configure
+these per currency; the effective values are visible in the merchant portal.
 
 ## 5. Ordering guarantee
 
@@ -109,6 +189,12 @@ Every bet follows a strict order so money is never at risk: validate the session
 and confirm it applied** → draw the provably-fair outcome → commit the round → credit any win → reveal
 the result to the player. A rejected or unfunded bet never draws an outcome, and a win is never shown for
 an unfunded bet.
+
+**Settlement can lag / be retried.** A `credit` or `rollback` for a debit may arrive seconds-to-minutes
+after the debit and out of band from live play (a failed settle is parked and retried by reconciliation
+until you acknowledge it). Honour a `credit`/`rollback` against its referenced debit **with no expiry**,
+and rely on `txn_ref` idempotency for the retries. A single debit is resolved by **at most one** `credit`
+**or** one `rollback` — never both.
 
 ## 6. Provably fair
 
@@ -122,8 +208,10 @@ revealed on rotation, so any player or you can independently verify any round.
   the wire). We register your `operator_id` and a `key_id`; you present that `key_id` as `X-Key-Id`.
 - The secret is used as its **raw UTF-8 bytes** in `HMAC_SHA256(secret, canonical)` — we do **not**
   hex- or base64-decode it first. Whatever string we exchange is the key material verbatim.
-- **Rotation:** we can hold more than one active key for you; sign with the new `key_id` while the old
-  one still verifies during the overlap, then we retire the old one.
+- **Rotation is two-directional.** We can hold more than one active key for you. On calls you sign to us,
+  present the new `key_id` while the old one still verifies during the overlap. On the wallet callbacks
+  **we** sign to you, keep **accepting both `key_id`s** (map `X-Key-Id` → the right secret) until we
+  confirm cut-over, then retire the old secret.
 
 ## 8. Callback registration
 
@@ -166,6 +254,7 @@ How to connect your platform to maczo Originals as a seamless aggregator. Full c
 |---|---|
 | `operator_id`, a signing `key_id`, the launch/catalog endpoints, the games catalog | Your **wallet callback base URL** + path prefix (`{yourWalletBase}{prefix}`) that we call |
 | The wire contract + interactive API reference + a sandbox to test against | Your **signing secret** (you generate it; exchanged out-of-band, never on the wire) |
+| Your **enabled currencies** provisioned (+ we confirm each currency's minor-unit exponent) | The **currencies** you want enabled + your **base currency** (settlement currency) |
 | Sandbox + a go-live approval | Your inbound **IP allowlist** (hosts that call our launch API) |
 
 ### The shared secret (important)
@@ -176,10 +265,20 @@ through any UI. It is used as its **raw UTF-8 bytes** in `HMAC_SHA256(secret, ca
 hex/base64-decoded. maczo provisions your secret before your operator can go active; until then wallet
 calls fail closed with `OPERATOR_CONFIG_ERROR`. Keys can be rotated with an overlap window (`X-Key-Id`).
 
+### Currencies & settlement (important)
+
+You **settle in your own currency** — every wallet callback is denominated in the currency you launch
+with, with **no FX on the wire**. During onboarding you tell us which currencies to enable (e.g. `THB`,
+or `USDT`) and your base currency; we confirm each one's authoritative minor-unit exponent. Supported:
+fiat 2 dp (`USD EUR GBP THB SGD MYR PHP INR IDR BRL MXN AUD CNY HKD`), fiat 0 dp (`JPY KRW VND`), crypto
+8 dp (`USDT USDC DAI BTC ETH BNB SOL TRX TON XRP DOGE LTC`). Amounts are integer minor units at that
+exponent — always read `currency_exp` from each callback; parse `*_minor` as a 64-bit integer (exp-8
+amounts can exceed `2^53`). Per-currency bet limits are derived automatically (RTP-safe).
+
 ## Steps
 
-1. **Register.** We onboard your operator and issue your `operator_id` + a signing `key_id`. You receive
-   portal credentials.
+1. **Register.** We onboard your operator and issue your `operator_id` + a signing `key_id`, and enable
+   your currencies (base + the set you requested). You receive portal credentials.
 2. **Implement the seamless wallet** — the five endpoints in the **Seamless Wallet API**, verifying our
    HMAC-SHA256 header signature. Then call our **Launch & Catalog API** (`/GameLogin`, `/GetGameList`,
    `/KickPlayer`, `/ReplayLogin`) signed the same way — one signing routine for both directions.
@@ -188,12 +287,22 @@ calls fail closed with `OPERATOR_CONFIG_ERROR`. Keys can be rotated with an over
 4. **Test on the sandbox** — point at `https://originals-api-dev.maczo.co`: `/GameLogin` → open the
    returned URL → place a bet → your wallet receives `debit`, then `credit` on a win (a loss never calls
    your wallet). Confirm idempotency (a replayed `txn_ref` returns `duplicate:true`, money moves once),
-   insufficient-funds, and the read-only `status(txn_ref)`. Your wallet is the source of the balance, so
-   you fund the test player on your side (maczo never mints funds).
+   insufficient-funds, and the read-only `status(txn_ref)`. **Confirm the `debit`/`credit` arrive in your
+   launch currency with the expected `currency_exp`, and that `amount_minor` matches the stake placed.**
+   Your wallet is the source of the balance, so you fund the test player on your side (maczo never mints).
 5. **Go live.** We approve production; your operator flips to active and your callback host is enabled
    for production traffic.
 6. **Reconcile.** Use the portal reports (GGR / turnover / RTP-actual / settlement) against your own
    ledger; commission statements are produced per your agreed basis.
+
+## What you can configure in the portal
+
+- **Integration:** your wallet callback base URL + path prefix, inbound IP allowlist, signing keys.
+- **Games:** the subset of the catalogue you offer (`GetGameList` returns only your enabled games).
+- **Currencies:** the subset of supported currencies you accept (within what we enabled for you).
+- **Limits:** you may **tighten** per-game limits only — raise the min bet, lower the max bet / max win;
+  you can never loosen the platform limits.
+- **Commercial:** your commission basis + rate (billing figure computed from aggregated totals).
 
 ## What you can rely on
 
@@ -225,8 +334,22 @@ info:
 
     - HTTP status is ALWAYS `200`. Classify the outcome on the body `code`, never on the HTTP status.
 
-    - All amounts are **integer minor units** (`amount_minor`) + `currency` (ISO-4217) + `currency_exp`
-      (minor-unit exponent). Never a float; the merchant supports the full `currency_exp` (no 2dp cap).
+    - **Settlement currency:** we call your wallet in the **exact currency you launched the session with**
+      (your enabled currency, e.g. THB or USDT) — there is **no FX on the wire**. `amount_minor` is in
+      that currency's minor units; every response you return is in the same `currency`/`currency_exp`.
+
+    - Money is **integer minor units** + `currency` + `currency_exp`. **Never a float.** `currency` is the
+      ISO-4217 code for fiat and maczo's symbol for crypto (`USDT`, `BTC`, …). `currency_exp` is present
+      and **authoritative on every callback** — scale to the exact value we send; never hard-code decimals.
+      Supported: fiat `USD EUR GBP THB SGD MYR PHP INR IDR BRL MXN AUD CNY HKD` = exp **2**;
+      `JPY KRW VND` = exp **0** (a 0-dp trap: `amount_minor:500` JPY is ¥500); crypto
+      `USDT USDC DAI BTC ETH BNB SOL TRX TON XRP DOGE LTC` = exp **8**.
+
+    - **Amounts fit int64.** At exp 8 a balance can exceed `2^53` — parse/emit every `*_minor` as a 64-bit
+      integer / big-integer, never a float or JS `Number`.
+
+    - Bet min/max and max-win are enforced **per settlement currency** (auto-derived, RTP-safe); a win
+      above the cap is clipped before `credit`.
 
     - Idempotency key = `txn_ref`. A duplicate returns `code: DUPLICATE`, `duplicate: true`, and the
       **LIVE** balance — it never re-moves money.
@@ -239,12 +362,25 @@ info:
     - Unknown / unrecognised `code` ⇒ fail closed (treated as `BAD_REQUEST`, never blind-retried).
 
 
-    **Authentication (header HMAC-SHA256).** Every request is signed with the per-merchant shared secret
-    selected by `X-Key-Id` (so a key can be rotated with an overlap window). The signature is
-    `HMAC_SHA256(secret, canonical)` where `canonical` is the newline-joined string:
-    `METHOD` + `PATH` + `X-Timestamp` + `X-Nonce` + `sha256hex(rawBody)`. Headers: `X-Signature`
-    (lowercase hex), `X-Timestamp` (unix seconds, within ±60 s), `X-Nonce` (single-use), `X-Key-Id`.
-    Reject outside the window or on a seen nonce (fail closed → `SIGNATURE_OR_CLOCK`).
+    **Authentication (header HMAC-SHA256).** Every request carries `X-Signature` (lowercase hex),
+    `X-Timestamp`, `X-Nonce`, `X-Key-Id`. `X-Signature = HMAC_SHA256(secret, canonical)` where `canonical`
+    is the newline-joined string (no trailing newline): `METHOD` (upper-case) + `PATH` + `X-Timestamp` +
+    `X-Nonce` + `sha256hex(rawBody)`. Verify rules (you VERIFY these on your wallet — get them exact):
+
+    - `PATH` is the **full request path including your prefix** — e.g. `/seamless/debit` — with **no query
+      string**.
+
+    - The secret is your out-of-band shared key used as its **raw UTF-8 bytes** (not hex/base64-decoded),
+      selected by `X-Key-Id` (rotate with an overlap window — accept both key ids until we cut over).
+
+    - `sha256hex(rawBody)` is over the **exact bytes received** (do not parse-then-re-serialize); an empty
+      body hashes as `sha256("")` = `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+
+    - `X-Timestamp` is unix **seconds** (not milliseconds), within **±60 s**; `X-Nonce` is single-use.
+      Compare in constant time; reject stale/replayed/bad → fail closed (`SIGNATURE_OR_CLOCK`).
+
+    `X-Signature` is a **per-request computed HMAC**, not a static credential — a generated client needs a
+    signing hook, not a fixed header value.
 servers:
   - url: https://{merchantWalletHost}{pathPrefix}
     description: The merchant's seamless wallet base URL + path prefix (from the operators registry).
@@ -269,12 +405,28 @@ paths:
         content:
           application/json:
             schema: { $ref: "#/components/schemas/DebitRequest" }
+            example:
+              operator_id: gpx_dev
+              player_ref: pa1b2c3d4_alice
+              txn_ref: 3f2a9c…(64 hex)
+              round_ref: 3f2a9c…(64 hex)
+              game_code: originals_dice
+              amount_minor: 100000
+              currency: THB
+              currency_exp: 2
       responses:
         "200":
-          description: Always 200; outcome is in the body.
+          description: Always 200; the outcome (success, DUPLICATE replay, or a reject) is in the body.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/MoneyResponse" }
+              examples:
+                success:
+                  value: { status: ok, code: OK, duplicate: false, old_balance_minor: 5000000, new_balance_minor: 4900000, currency: THB, currency_exp: 2, operator_ref: "your-ledger-id" }
+                duplicate:
+                  value: { status: ok, code: DUPLICATE, duplicate: true, old_balance_minor: 4900000, new_balance_minor: 4900000, currency: THB, currency_exp: 2, operator_ref: "your-ledger-id" }
+                insufficient_funds:
+                  value: { status: error, code: INSUFFICIENT_FUNDS, currency: THB, currency_exp: 2, message: "balance too low" }
   /credit:
     post:
       summary: Credit (settle a win). Only called when payout_minor > 0. Requires ref_txn_ref.
@@ -288,12 +440,28 @@ paths:
         content:
           application/json:
             schema: { $ref: "#/components/schemas/CreditRequest" }
+            example:
+              operator_id: gpx_dev
+              player_ref: pa1b2c3d4_alice
+              txn_ref: 3f2a9c…:WIN
+              ref_txn_ref: 3f2a9c…(the debit txn_ref)
+              round_ref: 3f2a9c…(64 hex)
+              game_code: originals_dice
+              payout_minor: 250000
+              valid_bet_minor: 100000
+              currency: THB
+              currency_exp: 2
       responses:
         "200":
-          description: Always 200; outcome is in the body.
+          description: Always 200; outcome in the body. TXN_NOT_FOUND if ref_txn_ref has no applied debit.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/MoneyResponse" }
+              examples:
+                success:
+                  value: { status: ok, code: OK, duplicate: false, old_balance_minor: 4900000, new_balance_minor: 5150000, currency: THB, currency_exp: 2, operator_ref: "your-ledger-id" }
+                no_prior_debit:
+                  value: { status: error, code: TXN_NOT_FOUND, currency: THB, currency_exp: 2, message: "no applied debit for ref_txn_ref" }
   /rollback:
     post:
       summary: Rollback (reverse an applied debit). amount_minor MUST equal the original debit.
@@ -307,12 +475,22 @@ paths:
         content:
           application/json:
             schema: { $ref: "#/components/schemas/RollbackRequest" }
+            example:
+              operator_id: gpx_dev
+              player_ref: pa1b2c3d4_alice
+              txn_ref: 3f2a9c…:RB
+              ref_txn_ref: 3f2a9c…(the debit txn_ref)
+              round_ref: 3f2a9c…(64 hex)
+              amount_minor: 100000
+              currency: THB
+              currency_exp: 2
       responses:
         "200":
-          description: Always 200; outcome is in the body.
+          description: Always 200; outcome is in the body. amount_minor MUST equal the original debit.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/MoneyResponse" }
+              example: { status: ok, code: OK, duplicate: false, old_balance_minor: 4900000, new_balance_minor: 5000000, currency: THB, currency_exp: 2, operator_ref: "your-ledger-id" }
   /status:
     post:
       summary: Read-only probe of whether a txn_ref applied (unknown-result recovery). Moves no money.
@@ -326,12 +504,18 @@ paths:
         content:
           application/json:
             schema: { $ref: "#/components/schemas/StatusRequest" }
+            example: { operator_id: gpx_dev, txn_ref: 3f2a9c…(64 hex) }
       responses:
         "200":
-          description: Always 200.
+          description: Always 200. Keyed by txn_ref alone (globally unique per operator); moves no money.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/StatusResponse" }
+              examples:
+                applied:
+                  value: { status: ok, code: OK, applied: true, old_balance_minor: 5000000, new_balance_minor: 4900000, currency: THB, currency_exp: 2 }
+                not_found:
+                  value: { status: ok, code: TXN_NOT_FOUND, applied: false, currency: THB, currency_exp: 2 }
   /balance:
     post:
       summary: Display-only balance for a player. Never used to authorize a bet.
@@ -345,12 +529,14 @@ paths:
         content:
           application/json:
             schema: { $ref: "#/components/schemas/BalanceRequest" }
+            example: { operator_id: gpx_dev, player_ref: pa1b2c3d4_alice, currency: THB }
       responses:
         "200":
-          description: Always 200.
+          description: Always 200. Display-only — never used to authorise a bet.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/BalanceResponse" }
+              example: { status: ok, code: OK, balance_minor: 5000000, currency: THB, currency_exp: 2 }
 components:
   securitySchemes:
     nativeSignature:
@@ -359,7 +545,9 @@ components:
       name: X-Signature
       description: >-
         HMAC-SHA256 hex over METHOD+PATH+X-Timestamp+X-Nonce+sha256hex(body). Accompanied by the
-        X-Timestamp, X-Nonce and X-Key-Id headers (see parameters).
+        X-Timestamp, X-Nonce and X-Key-Id headers (see parameters). NOTE: this is a **per-request
+        computed** signature, not a static credential — a generated client must supply a signing hook
+        (see the description for the exact canonical string + a worked vector in the wire contract guide).
   parameters:
     SigTimestamp:
       name: X-Timestamp
@@ -384,14 +572,23 @@ components:
       type: object
       required: [operator_id, player_ref, txn_ref, currency, currency_exp]
       properties:
-        operator_id: { type: string }
-        player_ref: { type: string, description: Merchant's durable player identity. }
-        txn_ref: { type: string, description: Idempotency key for this money move. }
-        round_ref: { type: string }
-        game_code: { type: string }
-        currency: { type: string, example: USD }
-        currency_exp: { type: integer, example: 2 }
-        request_hash: { type: string }
+        operator_id: { type: string, example: gpx_dev }
+        player_ref:
+          type: string
+          description: Your durable player identity, echoed verbatim (charset A-Za-z0-9._$?-, length 1–50).
+          example: pa1b2c3d4_alice
+        txn_ref:
+          type: string
+          description: Server-derived idempotency key for this money move (64-hex; you never mint it). Store UNIQUE; globally unique per operator.
+          example: 3f2a9c…(64 hex)
+        round_ref:
+          type: string
+          description: Round identity. credit + rollback echo it byte-identically from the debit; equals the debit txn_ref for single-shot rounds.
+          example: 3f2a9c…(64 hex)
+        game_code: { type: string, description: "originals_<id> (from GetGameList).", example: originals_dice }
+        currency: { type: string, description: "ISO-4217 for fiat, maczo symbol for crypto (USDT/BTC/…); the session's settlement currency.", example: THB }
+        currency_exp: { type: integer, description: Authoritative minor-unit exponent (read per-call; do not hard-code)., example: 2 }
+        request_hash: { type: string, description: "Advisory: a hash of the money request; you may use it to detect an IDEMPOTENCY_CONFLICT (same txn_ref, different body)." }
         meta: { type: object, additionalProperties: true }
     DebitRequest:
       allOf:
@@ -399,23 +596,23 @@ components:
         - type: object
           required: [amount_minor]
           properties:
-            amount_minor: { type: integer, minimum: 1, description: "Integer minor units, greater than zero." }
+            amount_minor: { type: integer, format: int64, minimum: 1, description: "Integer minor units (>0) in `currency` at `currency_exp`. Parse as int64/bigint — exp-8 amounts can exceed 2^53." }
     CreditRequest:
       allOf:
         - $ref: "#/components/schemas/Money"
         - type: object
           required: [payout_minor, ref_txn_ref]
           properties:
-            payout_minor: { type: integer, minimum: 0 }
-            valid_bet_minor: { type: integer, minimum: 0, description: Turnover-eligible stake. }
-            ref_txn_ref: { type: string, description: The prior applied debit's txn_ref. }
+            payout_minor: { type: integer, format: int64, minimum: 1, description: "Win amount in minor units (>0). Credit is win-only — a losing round never calls your wallet." }
+            valid_bet_minor: { type: integer, format: int64, minimum: 0, description: Turnover-eligible stake. }
+            ref_txn_ref: { type: string, description: The prior applied debit's txn_ref (round_ref echoes it)., example: 3f2a9c…(64 hex) }
     RollbackRequest:
       allOf:
         - $ref: "#/components/schemas/Money"
         - type: object
           required: [amount_minor, ref_txn_ref]
           properties:
-            amount_minor: { type: integer, minimum: 1, description: MUST equal the original debit. }
+            amount_minor: { type: integer, format: int64, minimum: 1, description: MUST equal the original debit (minor units). }
             ref_txn_ref: { type: string }
     StatusRequest:
       type: object
@@ -441,11 +638,11 @@ components:
           enum: [OK, DUPLICATE, INSUFFICIENT_FUNDS, SESSION_INVALID, SESSION_REPLACED, PLAYER_BLOCKED,
                  ALREADY_SETTLED, IDEMPOTENCY_CONFLICT, TXN_NOT_FOUND, OPERATOR_TIMEOUT,
                  OPERATOR_UNAVAILABLE, RATE_LIMITED, BAD_REQUEST, OPERATOR_CONFIG_ERROR, SIGNATURE_OR_CLOCK]
-        duplicate: { type: boolean, description: Idempotent replay — balance is the LIVE balance. }
-        old_balance_minor: { type: integer }
-        new_balance_minor: { type: integer }
-        currency: { type: string }
-        currency_exp: { type: integer }
+        duplicate: { type: boolean, description: "Idempotent replay — set true and return the LIVE balance in BOTH old_balance_minor and new_balance_minor." }
+        old_balance_minor: { type: integer, format: int64 }
+        new_balance_minor: { type: integer, format: int64 }
+        currency: { type: string, description: Must equal the request's currency. }
+        currency_exp: { type: integer, description: Must equal the request's currency_exp. }
         operator_ref: { type: string, description: "Merchant-side id, for the ledger join." }
         message: { type: string }
     StatusResponse:
@@ -455,19 +652,20 @@ components:
         status: { type: string, enum: [ok, error] }
         code: { type: string }
         applied: { type: boolean, description: Whether this txn_ref is durably applied. }
-        old_balance_minor: { type: integer, nullable: true }
-        new_balance_minor: { type: integer, nullable: true }
+        old_balance_minor: { type: integer, format: int64, nullable: true }
+        new_balance_minor: { type: integer, format: int64, nullable: true }
         currency: { type: string }
         currency_exp: { type: integer }
     BalanceResponse:
       type: object
-      required: [status, balance_minor, currency, currency_exp]
+      required: [status, currency, currency_exp]
       properties:
         status: { type: string, enum: [ok, error] }
         code: { type: string }
-        balance_minor: { type: integer }
+        balance_minor: { type: integer, format: int64, description: Present on success; in `currency` at `currency_exp`. }
         currency: { type: string }
         currency_exp: { type: integer }
+        message: { type: string }
 ```
 
 # OpenAPI specification — maczo-launch.v1.yaml
@@ -490,7 +688,10 @@ info:
 
     **Conventions (non-negotiable):**
 
-    - HTTP status is ALWAYS `200`. Classify the outcome on the body `code`, never on the HTTP status.
+    - A processed request answers HTTP `200` — classify the outcome on the body `code`. Two *transport*
+      exceptions: rate limiting → HTTP `429` `{code:"RATE_LIMITED", retryable:true}` with a `Retry-After`
+      header, and an internal error → HTTP `500` `{code:"INTERNAL", retryable:true}`. Retry those with
+      backoff.
 
     - `player_ref` is YOUR durable player identity (charset `A-Za-z0-9._$?-`, length 1–50). maczo binds
       it to the game session and echoes it **verbatim** on every wallet callback (`player_ref`). maczo
@@ -498,6 +699,13 @@ info:
 
     - `game_code` is exactly a value returned by `/GetGameList` (`originals_<id>`), passed back to
       `/GameLogin`. There is one product (`originals`).
+
+    - **Settlement currency:** launch with your enabled currency (`currency`); every subsequent wallet
+      callback settles in **that** currency (no FX). Supported: fiat (2 dp) `USD EUR GBP THB SGD MYR PHP
+      INR IDR BRL MXN AUD CNY HKD`; fiat (0 dp) `JPY KRW VND`; crypto (8 dp) `USDT USDC DAI BTC ETH BNB
+      SOL TRX TON XRP DOGE LTC`. maczo is authoritative for the exponent of a supported currency — you may
+      omit `currency_exp` and every callback carries the exact value to use. Your enabled currencies are
+      provisioned at onboarding; a currency outside your enabled set is rejected `BAD_REQUEST`.
 
     - Money is settled by the wallet callbacks in integer minor units; nothing here moves money.
 
@@ -560,7 +768,9 @@ paths:
             example: { operator_id: gpx_dev }
       responses:
         "200":
-          description: Always 200; the catalogue is in `games`.
+          description: >-
+            Always 200; the catalogue is in `games`. Returns only the games ENABLED for your operator
+            (per-operator + dynamic — re-sync periodically, do not hard-code the list).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/GameListResponse" }
@@ -663,7 +873,10 @@ components:
           example: pa1b2c3d4_alice
         currency:
           type: string
-          description: The player's wallet currency; must be in your enabled currencies. Defaults to your base currency.
+          description: >-
+            Your settlement currency for this session (must be one of your enabled currencies; defaults to
+            your base currency). Every wallet callback settles in this currency. See the supported list in
+            the API description.
           example: THB
         game_code:
           type: string
@@ -675,12 +888,14 @@ components:
         demo: { type: boolean, description: "Open a free fun-play session (no wallet, no money path).", default: false }
         currency_exp:
           type: integer
-          description: Minor-unit exponent — only needed for a wallet currency outside maczo's known table.
+          description: >-
+            Advanced/optional. For a supported currency maczo uses its authoritative exponent and IGNORES
+            this; you normally omit it. (Only consulted for a currency outside the supported table.)
           example: 2
         exchange_rate:
           type: string
           nullable: true
-          description: Optional USD-per-unit display rate for a currency maczo doesn't statically know.
+          description: Advanced/optional display rate — not used for native settlement; normally omit.
         meta: { type: object, additionalProperties: true, description: Optional passthrough. }
     GetGameListRequest:
       type: object
@@ -731,7 +946,7 @@ components:
       type: object
       required: [game_code, name, category, image_url, active]
       properties:
-        game_code: { type: string, description: Pass this back to /GameLogin., example: originals_dice }
+        game_code: { type: string, description: "Slug `originals_<lowercase-hyphenated-id>`; the sole value you pass back to /GameLogin & /ReplayLogin.", example: originals_dice }
         name: { type: string, example: Dice }
         category: { type: string, example: ORIGINALS }
         provider: { type: string, example: originals }
@@ -739,12 +954,14 @@ components:
         active: { type: boolean, example: true }
         has_demo: { type: boolean, example: true }
         interactive: { type: boolean, description: Multi-step game (start/step/cashout)., example: false }
-        live: { type: boolean, description: Shared-timed multiplayer round., example: false }
+        live: { type: boolean, description: "Shared-timed multiplayer round (none currently offered — always false).", example: false }
     LaunchCode:
       type: string
       description: >-
         Outcome code. `OK` = success. `OPERATOR_CONFIG_ERROR` = unknown/suspended operator or inbound IP
         not allowlisted. `BAD_REQUEST` = invalid player_ref / unknown game_code / currency not enabled.
         `SIGNATURE_OR_CLOCK` = bad/stale signature, timestamp outside window, or replayed nonce.
-      enum: [OK, OPERATOR_CONFIG_ERROR, BAD_REQUEST, SIGNATURE_OR_CLOCK]
+        `RATE_LIMITED` = too many requests (returned with HTTP 429 + Retry-After; retry with backoff).
+        `INTERNAL` = transient server error (HTTP 500; retryable).
+      enum: [OK, OPERATOR_CONFIG_ERROR, BAD_REQUEST, SIGNATURE_OR_CLOCK, RATE_LIMITED, INTERNAL]
 ```

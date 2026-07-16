@@ -62,6 +62,10 @@ blockquote{border-left:3px solid #1475E1;margin:14px 0;padding:6px 14px;backgrou
 <td>Your <strong>signing secret</strong> (you generate it; exchanged out-of-band, never on the wire)</td>
 </tr>
 <tr>
+<td>Your <strong>enabled currencies</strong> provisioned (+ we confirm each currency's minor-unit exponent)</td>
+<td>The <strong>currencies</strong> you want enabled + your <strong>base currency</strong> (settlement currency)</td>
+</tr>
+<tr>
 <td>Sandbox + a go-live approval</td>
 <td>Your inbound <strong>IP allowlist</strong> (hosts that call our launch API)</td>
 </tr>
@@ -73,10 +77,18 @@ issues the <code>operator_id</code> + <code>key_id</code>; the secret value neve
 through any UI. It is used as its <strong>raw UTF-8 bytes</strong> in <code>HMAC_SHA256(secret, canonical)</code> — not
 hex/base64-decoded. maczo provisions your secret before your operator can go active; until then wallet
 calls fail closed with <code>OPERATOR_CONFIG_ERROR</code>. Keys can be rotated with an overlap window (<code>X-Key-Id</code>).</p>
+<h3 id="currencies-settlement-important">Currencies &amp; settlement (important)</h3>
+<p>You <strong>settle in your own currency</strong> — every wallet callback is denominated in the currency you launch
+with, with <strong>no FX on the wire</strong>. During onboarding you tell us which currencies to enable (e.g. <code>THB</code>,
+or <code>USDT</code>) and your base currency; we confirm each one's authoritative minor-unit exponent. Supported:
+fiat 2 dp (<code>USD EUR GBP THB SGD MYR PHP INR IDR BRL MXN AUD CNY HKD</code>), fiat 0 dp (<code>JPY KRW VND</code>), crypto
+8 dp (<code>USDT USDC DAI BTC ETH BNB SOL TRX TON XRP DOGE LTC</code>). Amounts are integer minor units at that
+exponent — always read <code>currency_exp</code> from each callback; parse <code>*_minor</code> as a 64-bit integer (exp-8
+amounts can exceed <code>2^53</code>). Per-currency bet limits are derived automatically (RTP-safe).</p>
 <h2 id="steps">Steps</h2>
 <ol>
-<li><strong>Register.</strong> We onboard your operator and issue your <code>operator_id</code> + a signing <code>key_id</code>. You receive
-   portal credentials.</li>
+<li><strong>Register.</strong> We onboard your operator and issue your <code>operator_id</code> + a signing <code>key_id</code>, and enable
+   your currencies (base + the set you requested). You receive portal credentials.</li>
 <li><strong>Implement the seamless wallet</strong> — the five endpoints in the <strong>Seamless Wallet API</strong>, verifying our
    HMAC-SHA256 header signature. Then call our <strong>Launch &amp; Catalog API</strong> (<code>/GameLogin</code>, <code>/GetGameList</code>,
    <code>/KickPlayer</code>, <code>/ReplayLogin</code>) signed the same way — one signing routine for both directions.</li>
@@ -85,13 +97,23 @@ calls fail closed with <code>OPERATOR_CONFIG_ERROR</code>. Keys can be rotated w
 <li><strong>Test on the sandbox</strong> — point at <code>https://originals-api-dev.maczo.co</code>: <code>/GameLogin</code> → open the
    returned URL → place a bet → your wallet receives <code>debit</code>, then <code>credit</code> on a win (a loss never calls
    your wallet). Confirm idempotency (a replayed <code>txn_ref</code> returns <code>duplicate:true</code>, money moves once),
-   insufficient-funds, and the read-only <code>status(txn_ref)</code>. Your wallet is the source of the balance, so
-   you fund the test player on your side (maczo never mints funds).</li>
+   insufficient-funds, and the read-only <code>status(txn_ref)</code>. <strong>Confirm the <code>debit</code>/<code>credit</code> arrive in your
+   launch currency with the expected <code>currency_exp</code>, and that <code>amount_minor</code> matches the stake placed.</strong>
+   Your wallet is the source of the balance, so you fund the test player on your side (maczo never mints).</li>
 <li><strong>Go live.</strong> We approve production; your operator flips to active and your callback host is enabled
    for production traffic.</li>
 <li><strong>Reconcile.</strong> Use the portal reports (GGR / turnover / RTP-actual / settlement) against your own
    ledger; commission statements are produced per your agreed basis.</li>
 </ol>
+<h2 id="what-you-can-configure-in-the-portal">What you can configure in the portal</h2>
+<ul>
+<li><strong>Integration:</strong> your wallet callback base URL + path prefix, inbound IP allowlist, signing keys.</li>
+<li><strong>Games:</strong> the subset of the catalogue you offer (<code>GetGameList</code> returns only your enabled games).</li>
+<li><strong>Currencies:</strong> the subset of supported currencies you accept (within what we enabled for you).</li>
+<li><strong>Limits:</strong> you may <strong>tighten</strong> per-game limits only — raise the min bet, lower the max bet / max win;
+  you can never loosen the platform limits.</li>
+<li><strong>Commercial:</strong> your commission basis + rate (billing figure computed from aggregated totals).</li>
+</ul>
 <h2 id="what-you-can-rely-on">What you can rely on</h2>
 <ul>
 <li><strong>You are the source of truth for money</strong> — we never authorise a bet on a computed balance. Every

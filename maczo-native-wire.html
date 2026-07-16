@@ -129,27 +129,120 @@ X-Nonce
 sha256hex(rawBody)      # sha256 of the exact request body bytes; empty body -&gt; sha256(&quot;&quot;)
 </code></pre>
 <p>Reject anything outside the window or with a replayed nonce (fail closed → <code>SIGNATURE_OR_CLOCK</code>).</p>
+<p><strong>Rules that catch most integration bugs:</strong></p>
+<ul>
+<li><code>PATH</code> is the <strong>path only, no query string</strong>. On the wallet callbacks you verify, it is the full path
+  <strong>including your prefix</strong> — e.g. <code>/seamless/debit</code> (not <code>/debit</code>).</li>
+<li><code>X-Timestamp</code> is unix <strong>seconds</strong>, not milliseconds — do <strong>not</strong> use <code>Date.now()</code> (13 digits fails
+  every time). Keep your clock NTP-synced within 60 s.</li>
+<li>The secret is used as its <strong>raw UTF-8 bytes</strong> — not hex/base64-decoded. <code>METHOD</code> is upper-case; the
+  signature is lowercase hex; compare in constant time.</li>
+<li>Hash the <strong>raw bytes as received</strong>, before any JSON parsing. Do <strong>not</strong> parse-then-re-serialize to
+  compute the body hash — a change in key order or whitespace breaks the signature.</li>
+<li>Money idempotency is always the body <code>txn_ref</code>, <strong>never</strong> the transport <code>X-Nonce</code>. A retry of the same
+  money move carries the <strong>same <code>txn_ref</code></strong> but a <strong>new</strong> nonce/timestamp/signature. You only need to
+  remember a nonce for ~2× the freshness window (older ones fail the clock check anyway).</li>
+</ul>
+<p><strong>Worked example</strong> (verify your signer against this exact vector):</p>
+<pre><code>secret     = &quot;s3cr3t-sample-key&quot;          # raw UTF-8 bytes
+METHOD     = POST
+PATH       = /seamless/debit
+X-Timestamp= 1735732800
+X-Nonce    = 9f8e7d6c5b4a39281706f5e4d3c2b1a0
+body       = {&quot;operator_id&quot;:&quot;acme&quot;,&quot;player_ref&quot;:&quot;pa1b2c3d4_alice&quot;,&quot;txn_ref&quot;:&quot;3f2a...(64 hex)&quot;,&quot;round_ref&quot;:&quot;3f2a...(64 hex)&quot;,&quot;game_code&quot;:&quot;originals_dice&quot;,&quot;amount_minor&quot;:100000,&quot;currency&quot;:&quot;THB&quot;,&quot;currency_exp&quot;:2}
+sha256hex(body) = 4f378774511b191ff84c8b4a094cf92842bae0d5cec260165a6d8bf2db56a0a0
+canonical  = &quot;POST\n/seamless/debit\n1735732800\n9f8e7d6c5b4a39281706f5e4d3c2b1a0\n4f378774511b191ff84c8b4a094cf92842bae0d5cec260165a6d8bf2db56a0a0&quot;
+X-Signature= 8193277c573a073a6ed3426c73bf4ddf20b061e90b242e5e7229215cb57d6e0a
+</code></pre>
+<p>(An empty body hashes as <code>sha256("")</code> = <code>e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855</code>.)</p>
 <h2 id="4-money-model-non-negotiable">4. Money model (non-negotiable)</h2>
 <ul>
-<li><strong>HTTP status is always <code>200</code>.</strong> Classify the outcome on the body <code>code</code>, never on the HTTP status.</li>
-<li>Amounts are <strong>integer minor units</strong> (<code>amount_minor</code>) + <code>currency</code> (ISO-4217) + <code>currency_exp</code>
-  (minor-unit exponent). Never a float; full precision (e.g. 8-dp crypto) is supported.</li>
-<li><strong>Idempotency key = <code>txn_ref</code>.</strong> A duplicate returns <code>code: DUPLICATE</code>, <code>duplicate: true</code>, and the
-  <strong>live</strong> balance — it never re-moves money.</li>
-<li>A <code>credit</code> (win) or <code>rollback</code> MUST reference a prior applied debit via <code>ref_txn_ref</code>; a settle with no
-  prior debit returns <code>code: TXN_NOT_FOUND</code> (never silent). A losing round is settled internally and does
-  <strong>not</strong> call your wallet.</li>
-<li><code>status(txn_ref)</code> is a <strong>read-only</strong> query — it must never move money.</li>
+<li><strong>A processed request always answers HTTP <code>200</code></strong> — classify the outcome on the body <code>code</code>, never on
+  the HTTP status. (Two <em>transport</em> exceptions on calls <strong>to us</strong>: rate limiting → HTTP <code>429</code>
+  <code>{code:"RATE_LIMITED", retryable:true}</code> with a <code>Retry-After</code> header, and an internal error → HTTP
+  <code>500</code> <code>{code:"INTERNAL", retryable:true}</code>. Retry those with backoff. Your wallet, in turn, should
+  always answer <code>200</code>; we handle your timeouts/5xx as <code>OPERATOR_TIMEOUT</code>/<code>OPERATOR_UNAVAILABLE</code>.)</li>
+<li>Money is <strong>integer minor units</strong> + <code>currency</code> + <code>currency_exp</code> (the currency's minor-unit exponent).
+  <strong>Never a float.</strong> See §4a for the supported currencies and their exponents.</li>
+<li><strong><code>currency_exp</code> is present and authoritative on every money callback</strong> — always scale to the exact
+  <code>currency_exp</code> we send; never hard-code a currency's decimals.</li>
+<li><strong>Amounts fit a 64-bit integer.</strong> At <code>currency_exp: 8</code> (crypto) a balance/turnover can exceed
+  JavaScript's <code>2^53</code> safe-integer limit — parse and emit every <code>*_minor</code> field as a <strong>64-bit integer /
+  big-integer</strong>, never as a float or JS <code>Number</code>.</li>
+<li><strong>Idempotency key = <code>txn_ref</code></strong> (we derive it; you never mint it — store it <strong>unique</strong>):</li>
+<li>same <code>txn_ref</code> <strong>and same request</strong> → replay: return <code>code: DUPLICATE</code>, <code>duplicate: true</code>, and the
+    <strong>live</strong> balance in <strong>both</strong> <code>old_balance_minor</code> and <code>new_balance_minor</code>; move money <strong>once</strong>.</li>
+<li>same <code>txn_ref</code> but a <strong>different</strong> amount/currency/player → <code>code: IDEMPOTENCY_CONFLICT</code>; do <strong>not</strong>
+    apply (we send <code>request_hash</code> you may use to detect this).</li>
+<li>A <code>credit</code> (win) or <code>rollback</code> MUST reference the prior applied debit via <code>ref_txn_ref</code>; a settle with
+  no matching debit returns <code>code: TXN_NOT_FOUND</code> (never silent). <strong>A losing round never calls your
+  wallet.</strong> A debit is settled by <strong>at most one</strong> <code>credit</code> <strong>or</strong> one <code>rollback</code> — never both.</li>
+<li><code>status(txn_ref)</code> is a <strong>read-only</strong> query keyed by <code>txn_ref</code> alone (no <code>player_ref</code>). <code>txn_ref</code> is
+  globally unique per operator — key your ledger/dedup by <code>txn_ref</code>, not per-player — so <code>status</code> can
+  resolve it. It returns <code>applied: true|false</code> and moves no money.</li>
 <li>Unknown / unrecognised <code>code</code> ⇒ fail closed (treat as <code>BAD_REQUEST</code>).</li>
 </ul>
-<p><strong>Result codes:</strong> <code>OK</code>, <code>DUPLICATE</code>, <code>INSUFFICIENT_FUNDS</code>, <code>SESSION_INVALID</code>, <code>SESSION_REPLACED</code>,
-<code>PLAYER_BLOCKED</code>, <code>ALREADY_SETTLED</code>, <code>IDEMPOTENCY_CONFLICT</code>, <code>TXN_NOT_FOUND</code>, <code>OPERATOR_TIMEOUT</code>,
-<code>OPERATOR_UNAVAILABLE</code>, <code>RATE_LIMITED</code>, <code>BAD_REQUEST</code>, <code>OPERATOR_CONFIG_ERROR</code>, <code>SIGNATURE_OR_CLOCK</code>.</p>
+<p><strong>Result codes</strong> (you return these on your wallet; classify on <code>code</code>): <code>OK</code>, <code>DUPLICATE</code>,
+<code>INSUFFICIENT_FUNDS</code>, <code>SESSION_INVALID</code>, <code>SESSION_REPLACED</code>, <code>PLAYER_BLOCKED</code>, <code>ALREADY_SETTLED</code>,
+<code>IDEMPOTENCY_CONFLICT</code>, <code>TXN_NOT_FOUND</code>, <code>OPERATOR_TIMEOUT</code>, <code>OPERATOR_UNAVAILABLE</code>, <code>RATE_LIMITED</code>,
+<code>BAD_REQUEST</code>, <code>OPERATOR_CONFIG_ERROR</code>, <code>SIGNATURE_OR_CLOCK</code>.</p>
+<h2 id="4a-currencies-settlement-limits">4a. Currencies, settlement &amp; limits</h2>
+<p><strong>Settlement currency — the key fact.</strong> We call your wallet (<code>debit</code>/<code>credit</code>/<code>rollback</code>/<code>balance</code>) in the
+<strong>exact currency you launch the session with</strong> — your enabled currency (e.g. <strong>THB</strong>, or <strong>USDT</strong>). There
+is <strong>no FX on the wire</strong>: <code>amount_minor</code> is in your currency's minor units at its <code>currency_exp</code>, and every
+response you return is in that same currency/exponent. You do not receive USD and you do not convert.</p>
+<p><strong>Supported currencies + exponents</strong> (maczo is authoritative — for a supported currency you may omit
+<code>currency_exp</code> at launch; we ignore a supplied one and stamp the authoritative value on every callback):</p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th><code>currency</code> codes</th>
+<th><code>currency_exp</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fiat (2 dp)</td>
+<td>USD, EUR, GBP, THB, SGD, MYR, PHP, INR, IDR, BRL, MXN, AUD, CNY, HKD</td>
+<td><code>2</code></td>
+</tr>
+<tr>
+<td>Fiat (0 dp)</td>
+<td>JPY, KRW, VND</td>
+<td><code>0</code></td>
+</tr>
+<tr>
+<td>Crypto / stablecoin</td>
+<td>USDT, USDC, DAI, BTC, ETH, BNB, SOL, TRX, TON, XRP, DOGE, LTC</td>
+<td><code>8</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>currency</code> is the <strong>ISO-4217 code</strong> for fiat and maczo's <strong>symbol</strong> for crypto (e.g. <code>USDT</code>, <code>BTC</code>, <code>ETH</code>
+— not ISO). The <strong>0-dp fiats are a common trap</strong>: <code>amount_minor: 500</code> in JPY is ¥500 (not ¥5). Your
+enabled currencies are provisioned during onboarding (see the Onboarding guide) — a launch with a currency
+outside your enabled set is rejected <code>BAD_REQUEST</code>.</p>
+<p><strong>Examples across exponents</strong> (the launch currency flows unchanged into every callback):</p>
+<pre><code>฿1,000.00 THB (exp 2)  -&gt;  { &quot;amount_minor&quot;: 100000,        &quot;currency&quot;: &quot;THB&quot;,  &quot;currency_exp&quot;: 2 }
+¥1,000    JPY (exp 0)  -&gt;  { &quot;amount_minor&quot;: 1000,          &quot;currency&quot;: &quot;JPY&quot;,  &quot;currency_exp&quot;: 0 }
+0.00100000 BTC (exp 8) -&gt;  { &quot;amount_minor&quot;: 100000,        &quot;currency&quot;: &quot;BTC&quot;,  &quot;currency_exp&quot;: 8 }
+12.34567890 USDT       -&gt;  { &quot;amount_minor&quot;: 1234567890,    &quot;currency&quot;: &quot;USDT&quot;, &quot;currency_exp&quot;: 8 }
+</code></pre>
+<p><strong>Bet limits.</strong> Each game has a min-bet, max-bet, and max-win, enforced <strong>per settlement currency</strong>
+(auto-derived, RTP-safe, floored to the currency's exponent) — a bet below the min is rejected
+<code>BET_TOO_SMALL</code>, above the max <code>BET_TOO_LARGE</code>, and a win above the cap is clipped. You don't configure
+these per currency; the effective values are visible in the merchant portal.</p>
 <h2 id="5-ordering-guarantee">5. Ordering guarantee</h2>
 <p>Every bet follows a strict order so money is never at risk: validate the session → <strong>debit your wallet
 and confirm it applied</strong> → draw the provably-fair outcome → commit the round → credit any win → reveal
 the result to the player. A rejected or unfunded bet never draws an outcome, and a win is never shown for
 an unfunded bet.</p>
+<p><strong>Settlement can lag / be retried.</strong> A <code>credit</code> or <code>rollback</code> for a debit may arrive seconds-to-minutes
+after the debit and out of band from live play (a failed settle is parked and retried by reconciliation
+until you acknowledge it). Honour a <code>credit</code>/<code>rollback</code> against its referenced debit <strong>with no expiry</strong>,
+and rely on <code>txn_ref</code> idempotency for the retries. A single debit is resolved by <strong>at most one</strong> <code>credit</code>
+<strong>or</strong> one <code>rollback</code> — never both.</p>
 <h2 id="6-provably-fair">6. Provably fair</h2>
 <p>Every result is re-derivable from <code>(server_seed, client_seed, nonce)</code> via
 <code>HMAC-SHA256(server_seed, "client_seed:nonce:cursor")</code>. The server-seed hash is committed before use and
@@ -160,8 +253,10 @@ revealed on rotation, so any player or you can independently verify any round.</
   the wire). We register your <code>operator_id</code> and a <code>key_id</code>; you present that <code>key_id</code> as <code>X-Key-Id</code>.</li>
 <li>The secret is used as its <strong>raw UTF-8 bytes</strong> in <code>HMAC_SHA256(secret, canonical)</code> — we do <strong>not</strong>
   hex- or base64-decode it first. Whatever string we exchange is the key material verbatim.</li>
-<li><strong>Rotation:</strong> we can hold more than one active key for you; sign with the new <code>key_id</code> while the old
-  one still verifies during the overlap, then we retire the old one.</li>
+<li><strong>Rotation is two-directional.</strong> We can hold more than one active key for you. On calls you sign to us,
+  present the new <code>key_id</code> while the old one still verifies during the overlap. On the wallet callbacks
+  <strong>we</strong> sign to you, keep <strong>accepting both <code>key_id</code>s</strong> (map <code>X-Key-Id</code> → the right secret) until we
+  confirm cut-over, then retire the old secret.</li>
 </ul>
 <h2 id="8-callback-registration">8. Callback registration</h2>
 <p>You register (in the portal, or we set it at onboarding) your <strong>wallet callback base URL</strong> and a <strong>path

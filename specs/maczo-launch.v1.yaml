@@ -15,7 +15,10 @@ info:
 
     **Conventions (non-negotiable):**
 
-    - HTTP status is ALWAYS `200`. Classify the outcome on the body `code`, never on the HTTP status.
+    - A processed request answers HTTP `200` — classify the outcome on the body `code`. Two *transport*
+      exceptions: rate limiting → HTTP `429` `{code:"RATE_LIMITED", retryable:true}` with a `Retry-After`
+      header, and an internal error → HTTP `500` `{code:"INTERNAL", retryable:true}`. Retry those with
+      backoff.
 
     - `player_ref` is YOUR durable player identity (charset `A-Za-z0-9._$?-`, length 1–50). maczo binds
       it to the game session and echoes it **verbatim** on every wallet callback (`player_ref`). maczo
@@ -23,6 +26,13 @@ info:
 
     - `game_code` is exactly a value returned by `/GetGameList` (`originals_<id>`), passed back to
       `/GameLogin`. There is one product (`originals`).
+
+    - **Settlement currency:** launch with your enabled currency (`currency`); every subsequent wallet
+      callback settles in **that** currency (no FX). Supported: fiat (2 dp) `USD EUR GBP THB SGD MYR PHP
+      INR IDR BRL MXN AUD CNY HKD`; fiat (0 dp) `JPY KRW VND`; crypto (8 dp) `USDT USDC DAI BTC ETH BNB
+      SOL TRX TON XRP DOGE LTC`. maczo is authoritative for the exponent of a supported currency — you may
+      omit `currency_exp` and every callback carries the exact value to use. Your enabled currencies are
+      provisioned at onboarding; a currency outside your enabled set is rejected `BAD_REQUEST`.
 
     - Money is settled by the wallet callbacks in integer minor units; nothing here moves money.
 
@@ -85,7 +95,9 @@ paths:
             example: { operator_id: gpx_dev }
       responses:
         "200":
-          description: Always 200; the catalogue is in `games`.
+          description: >-
+            Always 200; the catalogue is in `games`. Returns only the games ENABLED for your operator
+            (per-operator + dynamic — re-sync periodically, do not hard-code the list).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/GameListResponse" }
@@ -188,7 +200,10 @@ components:
           example: pa1b2c3d4_alice
         currency:
           type: string
-          description: The player's wallet currency; must be in your enabled currencies. Defaults to your base currency.
+          description: >-
+            Your settlement currency for this session (must be one of your enabled currencies; defaults to
+            your base currency). Every wallet callback settles in this currency. See the supported list in
+            the API description.
           example: THB
         game_code:
           type: string
@@ -200,12 +215,14 @@ components:
         demo: { type: boolean, description: "Open a free fun-play session (no wallet, no money path).", default: false }
         currency_exp:
           type: integer
-          description: Minor-unit exponent — only needed for a wallet currency outside maczo's known table.
+          description: >-
+            Advanced/optional. For a supported currency maczo uses its authoritative exponent and IGNORES
+            this; you normally omit it. (Only consulted for a currency outside the supported table.)
           example: 2
         exchange_rate:
           type: string
           nullable: true
-          description: Optional USD-per-unit display rate for a currency maczo doesn't statically know.
+          description: Advanced/optional display rate — not used for native settlement; normally omit.
         meta: { type: object, additionalProperties: true, description: Optional passthrough. }
     GetGameListRequest:
       type: object
@@ -256,7 +273,7 @@ components:
       type: object
       required: [game_code, name, category, image_url, active]
       properties:
-        game_code: { type: string, description: Pass this back to /GameLogin., example: originals_dice }
+        game_code: { type: string, description: "Slug `originals_<lowercase-hyphenated-id>`; the sole value you pass back to /GameLogin & /ReplayLogin.", example: originals_dice }
         name: { type: string, example: Dice }
         category: { type: string, example: ORIGINALS }
         provider: { type: string, example: originals }
@@ -264,11 +281,13 @@ components:
         active: { type: boolean, example: true }
         has_demo: { type: boolean, example: true }
         interactive: { type: boolean, description: Multi-step game (start/step/cashout)., example: false }
-        live: { type: boolean, description: Shared-timed multiplayer round., example: false }
+        live: { type: boolean, description: "Shared-timed multiplayer round (none currently offered — always false).", example: false }
     LaunchCode:
       type: string
       description: >-
         Outcome code. `OK` = success. `OPERATOR_CONFIG_ERROR` = unknown/suspended operator or inbound IP
         not allowlisted. `BAD_REQUEST` = invalid player_ref / unknown game_code / currency not enabled.
         `SIGNATURE_OR_CLOCK` = bad/stale signature, timestamp outside window, or replayed nonce.
-      enum: [OK, OPERATOR_CONFIG_ERROR, BAD_REQUEST, SIGNATURE_OR_CLOCK]
+        `RATE_LIMITED` = too many requests (returned with HTTP 429 + Retry-After; retry with backoff).
+        `INTERNAL` = transient server error (HTTP 500; retryable).
+      enum: [OK, OPERATOR_CONFIG_ERROR, BAD_REQUEST, SIGNATURE_OR_CLOCK, RATE_LIMITED, INTERNAL]
